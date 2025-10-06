@@ -52,6 +52,29 @@ Usage examples
 - Few-points (1%) + FG-biased crop:
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_points --fewshot_ratio 0.01 --fp_dilate_radius 1 --fg_crop_prob 0.7 --output_dir runs/fewpoints_01pct_fgcrop ...`
 
+Virtualenv and quick sanity tests
+
+- Activate the project virtual environment:
+  - `source venv/bin/activate`
+  - Confirm: `python --version` and `python -c "import torch, monai; print(torch.__version__)"`
+- Quick unit check for slice supervision (runs on CPU):
+  - `python - << 'PY'` then paste:
+    ```python
+    import torch
+    from train_finetune_wp5 import _select_slices_mask_per_sample, build_slice_supervision_mask
+    B,C,X,Y,Z=1,1,8,10,12
+    lbl=torch.zeros((B,C,X,Y,Z),dtype=torch.long)
+    lbl[:,:,2,:,:]=1; lbl[:,:,:,4,:]=2; lbl[:,:,:,:,7]=3
+    for ax in (0,1,2):
+        m=_select_slices_mask_per_sample(lbl,axis=ax,k=1)
+        print('axis',ax,'shape',m.shape,'cov',float(m.float().mean()))
+    m_all=build_slice_supervision_mask(lbl,roi=(X,Y,Z),axis_mode='multi',ratio=0.2,k_override=None)
+    print('multi coverage',float(m_all.float().mean()))
+    ```
+    end with `PY` on its own line.
+- Debugging device asserts (optional):
+  - Prefix a single run with `CUDA_LAUNCH_BLOCKING=1` to catch the exact failing op.
+
 Notes
 
 - Consistency/entropy/pseudo-labeling are not enabled; can be added later behind flags if needed.

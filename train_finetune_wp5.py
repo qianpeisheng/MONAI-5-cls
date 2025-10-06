@@ -505,32 +505,45 @@ def compute_metrics(pred: torch.Tensor, gt: torch.Tensor, heavy: bool = True) ->
 
 
 def _select_slices_mask_per_sample(lbl: torch.Tensor, axis: int, k: int) -> torch.Tensor:
-    """Return mask for selected K slices along given axis for a single sample label tensor (1,X,Y,Z).
+    """Return mask for selected K slices along given axis for a single sample.
+
+    Expects lbl shape (1,1,X,Y,Z). Builds a boolean mask of the same shape with True on selected slices.
     Strategy: pick top-K slices by foreground voxel count over classes 1..4 (ignoring 6).
+    axis: 0->X, 1->Y, 2->Z (spatial axes)
     """
-    # lbl shape (1,X,Y,Z)
-    fg = (lbl != 0) & (lbl != 6)
-    # Sum over the two non-axis spatial dims
-    if axis == 2:  # Z axis
-        counts = fg.sum(dim=(0, 1, 2))  # (Z)
-        k = max(1, min(int(k), counts.numel()))
-        topk = torch.topk(counts, k=k, largest=True).indices
-        mask = torch.zeros_like(fg, dtype=torch.bool)
-        mask[:, :, :, topk] = True
-    elif axis == 1:  # Y
-        counts = fg.sum(dim=(0, 1, 3))  # (Y)
-        k = max(1, min(int(k), counts.numel()))
-        topk = torch.topk(counts, k=k, largest=True).indices
-        mask = torch.zeros_like(fg, dtype=torch.bool)
-        mask[:, :, topk, :] = True
-    elif axis == 0:  # X
-        counts = fg.sum(dim=(0, 2, 3))  # (X)
-        k = max(1, min(int(k), counts.numel()))
-        topk = torch.topk(counts, k=k, largest=True).indices
-        mask = torch.zeros_like(fg, dtype=torch.bool)
-        mask[:, topk, :, :] = True
+    # lbl: (1,1,X,Y,Z)
+    if lbl.ndim != 5:
+        raise ValueError(f"Expected 5D lbl (B=1,C=1,X,Y,Z), got shape={tuple(lbl.shape)}")
+
+    device = lbl.device
+    fg = (lbl != 0) & (lbl != 6)  # (1,1,X,Y,Z)
+
+    # Compute per-slice counts along the requested axis
+    if axis == 2:  # Z axis (dim index 4 in 5D tensor)
+        counts = fg.sum(dim=(0, 1, 2, 3))  # (Z)
+        axis_len = fg.shape[4]
+    elif axis == 1:  # Y axis (dim index 3)
+        counts = fg.sum(dim=(0, 1, 2, 4))  # (Y)
+        axis_len = fg.shape[3]
+    elif axis == 0:  # X axis (dim index 2)
+        counts = fg.sum(dim=(0, 1, 3, 4))  # (X)
+        axis_len = fg.shape[2]
     else:
         raise ValueError("axis must be 0,1,2 for X,Y,Z")
+
+    # Determine K and indices
+    k_eff = max(1, min(int(k), int(counts.numel())))
+    topk = torch.topk(counts, k=k_eff, largest=True).indices.to(device)
+
+    # Build mask
+    mask = torch.zeros_like(fg, dtype=torch.bool)
+    if axis == 2:  # Z
+        mask[:, :, :, :, topk] = True
+    elif axis == 1:  # Y
+        mask[:, :, :, topk, :] = True
+    else:  # X
+        mask[:, :, topk, :, :] = True
+
     return mask
 
 
@@ -556,15 +569,11 @@ def build_slice_supervision_mask(labels: torch.Tensor, roi: Tuple[int, int, int]
         kx = k_override if (k_override and k_override > 0) else k_from_ratio(X)
         ks = {0: kx}
     elif axis_mode == "multi":
-        # Split roughly evenly across axes based on their lengths
-        total = k_override if (k_override and k_override > 0) else k_from_ratio((X + Y + Z) // 3)
-        # Distribute proportionally to axis length
-        lengths = np.array([X, Y, Z], dtype=float)
-        props = lengths / lengths.sum()
-        arr = (props * total).round().astype(int)
-        # Ensure at least 1 in each selected axis
-        arr[arr == 0] = 1
-        ks = {0: int(arr[0]), 1: int(arr[1]), 2: int(arr[2])}
+        # Determine K independently per axis based on its length
+        kx = k_override if (k_override and k_override > 0) else k_from_ratio(X)
+        ky = k_override if (k_override and k_override > 0) else k_from_ratio(Y)
+        kz = k_override if (k_override and k_override > 0) else k_from_ratio(Z)
+        ks = {0: kx, 1: ky, 2: kz}
     else:
         raise ValueError("axis_mode must be one of {'x','y','z','multi'}")
 
