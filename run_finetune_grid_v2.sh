@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
-# Schedule 6 WP5 fine-tune experiments on 2 GPUs:
-#  - init in {scratch, pretrained}
-#  - subset_ratio in {1.0 (100%), 0.1 (10%), 0.01 (1%)}
-# Runs sequentially per GPU and in parallel across 2 GPUs.
+# Schedule 6 WP5 fine-tune experiments with configurable normalization.
+# - init in {scratch, pretrained}
+# - subset_ratio in {1.0 (100%), 0.1 (10%), 0.01 (1%)}
+# - normalization via --norm: clip_zscore (default), fixed_wp5, or none
 #
 # Usage:
-#   bash run_finetune_grid.sh /path/to/pretrained.ckpt
+#   bash run_finetune_grid_v2.sh /path/to/pretrained.ckpt
 # or set env vars:
-#   PRETRAINED_CKPT=/path/to/pretrained.ckpt bash run_finetune_grid.sh
+#   PRETRAINED_CKPT=/path/to/pretrained.ckpt bash run_finetune_grid_v2.sh
 #
 # Optional env overrides:
 #   DATA_ROOT=/data3/wp5/wp5-code/dataloaders/wp5-dataset \
 #   SPLIT_CFG=/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
-#   GPUS="0 1" EPOCHS=100 BATCH_SIZE=2 LR=1e-3 NUM_WORKERS=4 SEED=42 bash run_finetune_grid.sh
+#   GPUS="0 1" EPOCHS=100 BATCH_SIZE=2 LR=1e-3 NUM_WORKERS=4 SEED=42 \
+#   NORM=clip_zscore OUT_ROOT=runs/grid_clipz \
+#   bash run_finetune_grid_v2.sh
 
 set -euo pipefail
 
@@ -25,12 +27,16 @@ BATCH_SIZE=${BATCH_SIZE:-2}
 LR=${LR:-1e-3}
 NUM_WORKERS=${NUM_WORKERS:-4}
 SEED=${SEED:-42}
+NORM=${NORM:-clip_zscore}  # clip_zscore | fixed_wp5 | none
 
 SCRIPT=${SCRIPT:-train_finetune_wp5.py}
 if [[ ! -f "$SCRIPT" ]]; then
   echo "ERROR: $SCRIPT not found in current directory." >&2
   exit 1
 fi
+
+# Output root tagged by normalization
+OUT_ROOT=${OUT_ROOT:-runs/grid_${NORM}}
 
 # Pretrained ckpt path from arg or env; if missing, try to download and then discover
 DEFAULT_PRETRAINED_DIR=${DEFAULT_PRETRAINED_DIR:-pretrained_models/spleen_ct_segmentation}
@@ -42,8 +48,7 @@ PRETRAINED_CKPT=${PRETRAINED_CKPT:-${1:-$DEFAULT_PRETRAINED_CKPT}}
 if [[ ! -f "$PRETRAINED_CKPT" ]]; then
   echo "Attempting to download MONAI bundle 'spleen_ct_segmentation' to $DEFAULT_PRETRAINED_DIR ..."
   mkdir -p "$DEFAULT_PRETRAINED_DIR"
-  # Try a lightweight Python call to download the bundle
-  DEFAULT_PRETRAINED_DIR="$DEFAULT_PRETRAINED_DIR" python - <<'PY'
+  DEFAULT_PRETRAINED_DIR="$DEFAULT_PRETRAINED_DIR" python3 - <<'PY'
 import sys, os
 try:
     from monai.bundle import download
@@ -92,7 +97,7 @@ run_chain() {
   local init="$1"; shift
 
   export CUDA_VISIBLE_DEVICES="$gpu"
-  echo "[GPU $gpu] Starting chain: init=$init"
+  echo "[GPU $gpu] Starting chain: init=$init, norm=$NORM"
 
   # Skip pretrained chain if checkpoint is unavailable
   if [[ "$init" == "pretrained" ]] && [[ ! -f "$PRETRAINED_CKPT" ]]; then
@@ -102,12 +107,12 @@ run_chain() {
 
   for r in "${SUBSETS[@]}"; do
     local tag; tag=$(tag_for_ratio "$r")
-    local out="runs/grid/${init}_subset_${tag}"
+    local out="$OUT_ROOT/${init}_subset_${tag}"
     mkdir -p "$out"
     echo "[GPU $gpu] Running: subset_ratio=$r -> $out"
 
     if [[ "$init" == "pretrained" ]]; then
-      python -u "$SCRIPT" \
+      python3 -u "$SCRIPT" \
         --mode train \
         --data_root "$DATA_ROOT" \
         --split_cfg "$SPLIT_CFG" \
@@ -120,11 +125,12 @@ run_chain() {
         --subset_ratio "$r" \
         --seed "$((SEED+1))" \
         --net basicunet \
+        --norm "$NORM" \
         ${BUNDLE_DIR:+--bundle_dir "$BUNDLE_DIR"} \
         --init pretrained \
         --pretrained_ckpt "$PRETRAINED_CKPT" | tee "$out/train.log"
     else
-      python -u "$SCRIPT" \
+      python3 -u "$SCRIPT" \
         --mode train \
         --data_root "$DATA_ROOT" \
         --split_cfg "$SPLIT_CFG" \
@@ -136,13 +142,14 @@ run_chain() {
         --subset_ratio "$r" \
         --seed "$SEED" \
         --net basicunet \
+        --norm "$NORM" \
         ${BUNDLE_DIR:+--bundle_dir "$BUNDLE_DIR"} \
         --init scratch \
         --pretrained_ckpt "$PRETRAINED_CKPT" | tee "$out/train.log"
     fi
   done
 
-  echo "[GPU $gpu] Chain complete: init=$init"
+  echo "[GPU $gpu] Chain complete: init=$init, norm=$NORM"
 }
 
 # Assign one chain to each GPU
@@ -161,4 +168,4 @@ fi
 ) &
 
 wait
-echo "All experiments complete."
+echo "All experiments complete. Output root: $OUT_ROOT"
