@@ -107,6 +107,24 @@ def build_datalists(data_dir: Path, cfg_path: Path) -> Tuple[List[Dict], List[Di
     return train, test
 
 
+def override_train_labels(train_list: List[Dict], override_dir: Path) -> List[Dict]:
+    """Override training label paths with files from override_dir mirroring basenames.
+
+    Keeps 'image' unchanged. Only adjusts 'label' for training records.
+    """
+    out: List[Dict] = []
+    for rec in train_list:
+        lbl_path = Path(rec["label"]) if rec.get("label") else None
+        if lbl_path is None:
+            out.append(rec)
+            continue
+        new_lbl = override_dir / lbl_path.name
+        r = dict(rec)
+        r["label"] = str(new_lbl)
+        out.append(r)
+    return out
+
+
 def subset_datalist(datalist: List[Dict], ratio: float, seed: int) -> List[Dict]:
     if ratio >= 0.999:
         return list(datalist)
@@ -152,6 +170,8 @@ def precompute_static_global_seed_masks(
     no_overlap: bool,
     dilation_shape: str = "auto",
     seed: int = 42,
+    sample_mode: str = "stratified",
+    uniform_exclude6: bool = False,
 ) -> None:
     """Precompute global seed and dilated supervision masks, plus propagated pseudo labels.
 
@@ -233,82 +253,111 @@ def precompute_static_global_seed_masks(
         seed_mask = torch.zeros((X, Y, Z), dtype=torch.bool)
         blocked = torch.zeros((X, Y, Z), dtype=torch.bool) if no_overlap else None
 
-        # Foreground allocation across classes 1..4
-        class_idxs = {}
-        for c in [1, 2, 3, 4]:
-            idx = (lbl == c).nonzero(as_tuple=False)
-            class_idxs[c] = idx
-        bg_idx = (lbl == 0).nonzero(as_tuple=False)
-
-        fg_total = alloc["fg"]
-        bg_total = alloc["bg"]
-
-        if fg_total > 0:
-            if balance == "uniform":
-                per_cls = np.full(4, fg_total // 4, dtype=int)
-                per_cls[: fg_total % 4] += 1
-                cls_order = [1, 2, 3, 4]
+        if sample_mode == "uniform_all":
+            # Uniform random sampling across ALL voxels (including background)
+            total_voxels = X * Y * Z
+            if uniform_exclude6:
+                # Eligible = not class 6
+                elig = (lbl != 6)
+                elig_idx = elig.nonzero(as_tuple=False)
+                elig_cnt = int(elig_idx.shape[0])
+                seeds_v = max(0, int(np.round(ratio * elig_cnt)))
+                if seeds_v >= elig_cnt:
+                    seed_mask[:, :, :] = elig
+                elif seeds_v > 0 and elig_cnt > 0:
+                    perm = torch.randperm(elig_cnt, generator=g)[:seeds_v]
+                    sel = elig_idx[perm]
+                    seed_mask[sel[:, 0], sel[:, 1], sel[:, 2]] = True
             else:
-                counts = np.array([
-                    class_idxs[1].shape[0], class_idxs[2].shape[0], class_idxs[3].shape[0], class_idxs[4].shape[0]
-                ], dtype=float)
-                s = counts.sum()
-                if s > 0:
-                    per_cls = np.floor(fg_total * (counts / s)).astype(int)
-                    rem = fg_total - per_cls.sum()
-                    order = np.argsort(-counts)
-                    for i in range(rem):
-                        per_cls[order[i % len(order)]] += 1
-                else:
-                    per_cls = np.zeros(4, dtype=int)
-                cls_order = [1, 2, 3, 4]
+                seeds_v = max(0, int(np.round(ratio * total_voxels)))
+                if seeds_v >= total_voxels:
+                    seed_mask[:, :, :] = True
+                elif seeds_v > 0:
+                    # Sample unique flat indices, then unravel
+                    perm = torch.randperm(total_voxels, generator=g)[:seeds_v]
+                    yz = Y * Z
+                    xs = (perm // yz)
+                    rem = perm % yz
+                    ys = rem // Z
+                    zs = rem % Z
+                    seed_mask[xs, ys, zs] = True
+        else:
+            # Foreground allocation across classes 1..4 + background share
+            class_idxs = {}
+            for c in [1, 2, 3, 4]:
+                idx = (lbl == c).nonzero(as_tuple=False)
+                class_idxs[c] = idx
+            bg_idx = (lbl == 0).nonzero(as_tuple=False)
 
-            for i, c in enumerate(cls_order):
-                n = int(per_cls[i])
-                if n <= 0:
-                    continue
-                idx = class_idxs[c]
-                if idx.shape[0] == 0:
-                    continue
+            fg_total = alloc["fg"]
+            bg_total = alloc["bg"]
+
+            if fg_total > 0:
+                if balance == "uniform":
+                    per_cls = np.full(4, fg_total // 4, dtype=int)
+                    per_cls[: fg_total % 4] += 1
+                    cls_order = [1, 2, 3, 4]
+                else:
+                    counts = np.array([
+                        class_idxs[1].shape[0], class_idxs[2].shape[0], class_idxs[3].shape[0], class_idxs[4].shape[0]
+                    ], dtype=float)
+                    s = counts.sum()
+                    if s > 0:
+                        per_cls = np.floor(fg_total * (counts / s)).astype(int)
+                        rem = fg_total - per_cls.sum()
+                        order = np.argsort(-counts)
+                        for i in range(rem):
+                            per_cls[order[i % len(order)]] += 1
+                    else:
+                        per_cls = np.zeros(4, dtype=int)
+                    cls_order = [1, 2, 3, 4]
+
+                for i, c in enumerate(cls_order):
+                    n = int(per_cls[i])
+                    if n <= 0:
+                        continue
+                    idx = class_idxs[c]
+                    if idx.shape[0] == 0:
+                        continue
+                    if no_overlap and blocked is not None and idx.shape[0] > 0:
+                        ok = ~blocked[idx[:, 0], idx[:, 1], idx[:, 2]]
+                        idx = idx[ok]
+                    if idx.shape[0] == 0:
+                        continue
+                    perm = torch.randperm(idx.shape[0], generator=g)[: min(n, idx.shape[0])]
+                    sel = idx[perm]
+                    seed_mask[sel[:, 0], sel[:, 1], sel[:, 2]] = True
+                    if no_overlap and blocked is not None:
+                        added = torch.zeros_like(seed_mask)
+                        added[sel[:, 0], sel[:, 1], sel[:, 2]] = True
+                        if shape == "cube":
+                            dil = torch.nn.functional.max_pool3d(
+                                added[None, None].float(), kernel_size=k, stride=1, padding=dilate_radius
+                            ) > 0.5
+                            blocked |= dil[0, 0]
+                        else:
+                            blocked |= cross_dilate(added, dilate_radius)
+
+            # Background
+            if bg_total > 0 and bg_idx.shape[0] > 0:
+                idx = bg_idx
                 if no_overlap and blocked is not None and idx.shape[0] > 0:
                     ok = ~blocked[idx[:, 0], idx[:, 1], idx[:, 2]]
                     idx = idx[ok]
-                if idx.shape[0] == 0:
-                    continue
-                perm = torch.randperm(idx.shape[0], generator=g)[: min(n, idx.shape[0])]
-                sel = idx[perm]
-                seed_mask[sel[:, 0], sel[:, 1], sel[:, 2]] = True
-                if no_overlap and blocked is not None:
-                    added = torch.zeros_like(seed_mask)
-                    added[sel[:, 0], sel[:, 1], sel[:, 2]] = True
-                    if shape == "cube":
-                        dil = torch.nn.functional.max_pool3d(
-                            added[None, None].float(), kernel_size=k, stride=1, padding=dilate_radius
-                        ) > 0.5
-                        blocked |= dil[0, 0]
-                    else:
-                        blocked |= cross_dilate(added, dilate_radius)
-
-        # Background
-        if bg_total > 0 and bg_idx.shape[0] > 0:
-            idx = bg_idx
-            if no_overlap and blocked is not None and idx.shape[0] > 0:
-                ok = ~blocked[idx[:, 0], idx[:, 1], idx[:, 2]]
-                idx = idx[ok]
-            if idx.shape[0] > 0:
-                perm = torch.randperm(idx.shape[0], generator=g)[: min(bg_total, idx.shape[0])]
-                sel = idx[perm]
-                seed_mask[sel[:, 0], sel[:, 1], sel[:, 2]] = True
-                if no_overlap and blocked is not None:
-                    added = torch.zeros_like(seed_mask)
-                    added[sel[:, 0], sel[:, 1], sel[:, 2]] = True
-                    if shape == "cube":
-                        dil = torch.nn.functional.max_pool3d(
-                            added[None, None].float(), kernel_size=k, stride=1, padding=dilate_radius
-                        ) > 0.5
-                        blocked |= dil[0, 0]
-                    else:
-                        blocked |= cross_dilate(added, dilate_radius)
+                if idx.shape[0] > 0:
+                    perm = torch.randperm(idx.shape[0], generator=g)[: min(bg_total, idx.shape[0])]
+                    sel = idx[perm]
+                    seed_mask[sel[:, 0], sel[:, 1], sel[:, 2]] = True
+                    if no_overlap and blocked is not None:
+                        added = torch.zeros_like(seed_mask)
+                        added[sel[:, 0], sel[:, 1], sel[:, 2]] = True
+                        if shape == "cube":
+                            dil = torch.nn.functional.max_pool3d(
+                                added[None, None].float(), kernel_size=k, stride=1, padding=dilate_radius
+                            ) > 0.5
+                            blocked |= dil[0, 0]
+                        else:
+                            blocked |= cross_dilate(added, dilate_radius)
 
         # Build dilated supervision mask and propagated pseudo labels
         if shape == "cube":
@@ -354,11 +403,25 @@ def precompute_static_global_seed_masks(
         _np.save(masks_dir / f"{safe_id}_seedmask.npy", seed_mask.cpu().numpy()[None, ...])
         _np.save(masks_dir / f"{safe_id}_supmask.npy", sup.cpu().numpy()[None, ...])
         _np.save(masks_dir / f"{safe_id}_pseudolabel.npy", pseudo.cpu().numpy()[None, ...])
+        # Stats with clarity about denominators
+        total_vox = X * Y * Z
+        if sample_mode == "uniform_all" and uniform_exclude6:
+            elig_cnt = int(((lbl != 6).sum()).item())
+            elig_frac = float(elig_cnt) / float(total_vox)
+            denom_mode = "eligible(lbl!=6)"
+        else:
+            elig_cnt = total_vox
+            elig_frac = 1.0
+            denom_mode = "all"
         stats = {
             "id": case_id,
             "shape": [1, X, Y, Z],
             "seed_fraction": float(seed_mask.float().mean().item()),
             "sup_fraction": float(sup.float().mean().item()),
+            "eligible_fraction": float(elig_frac),
+            "eligible_count": int(elig_cnt),
+            "ratio": float(ratio),
+            "denominator": denom_mode,
             "dilation_shape": shape,
             "radius": int(dilate_radius),
         }
@@ -631,6 +694,16 @@ class LoadSavedMasksD(MapTransform):
         if plp.exists():
             # store as int64 for CE targets later
             d["pseudo_label"] = np.load(plp).astype(np.int64)
+        # Build a valid_mask (1 within original FOV, 0 in padded region after SpatialPadd)
+        # Prefer the sup_mask shape if available, else infer from label
+        if "sup_mask" in d and isinstance(d["sup_mask"], np.ndarray):
+            shp = d["sup_mask"].shape
+            d["valid_mask"] = np.ones(shp, dtype=bool)
+        else:
+            label = d.get("label")
+            if isinstance(label, np.ndarray):
+                # assume channel-first
+                d["valid_mask"] = np.ones_like(label, dtype=bool)
         return d
 
 
@@ -677,8 +750,12 @@ def get_transforms(
             seq.append(LoadSavedMasksD(keys=["label"], id_key="id", dir_path=save_sup_masks_dir))
         if norm_transform is not None:
             seq.append(norm_transform)
-        pad_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label"] if static_points else ["image", "label"]
-        seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi))
+        # Only pad during training to support fixed-size crops.
+        # For validation, avoid padding labels so evaluation is computed on true FOV only;
+        # sliding_window_inference pads internally as needed and returns the original spatial size.
+        if training:
+            pad_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
+            seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi))
         # Optional intensity augmentations (training only)
         if training and aug_intensity:
             seq.extend(
@@ -689,7 +766,7 @@ def get_transforms(
                 ]
             )
         if include_aug:
-            flip_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label"] if static_points else ["image", "label"]
+            flip_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
             seq.extend([
                 RandFlipd(keys=flip_keys, spatial_axis=0, prob=0.5),
                 RandFlipd(keys=flip_keys, spatial_axis=1, prob=0.5),
@@ -697,10 +774,10 @@ def get_transforms(
             ])
         if include_crop:
             if fg_crop_prob > 0.0 and training:
-                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label"] if static_points else ["image", "label"]
+                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
                 seq.append(FGBiasedCropD(keys=crop_keys, roi_size=roi, prob=fg_crop_prob, margin=fg_crop_margin))
             else:
-                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label"] if static_points else ["image", "label"]
+                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
                 seq.append(RandSpatialCropd(keys=crop_keys, roi_size=roi, random_size=False))
         return seq
 
@@ -1240,6 +1317,76 @@ def build_points_supervision_mask(
     return sup_out
 
 
+def precompute_sup_masks_from_selected_points(
+    train_list: List[Dict],
+    selected_points_dir: Path,
+    pseudo_label_dir: Path | None,
+    out_dir: Path,
+    dilate_radius: int = 1,
+) -> None:
+    """Precompute static few_points masks from preselected points and optional dense pseudo labels.
+
+    Expects per-case files:
+      - <selected_points_dir>/<id>/mask_selected_points.nii
+      - optional pseudo label at <pseudo_label_dir>/<basename_label_file>
+
+    Saves per-case:
+      - <out_dir>/<id>_seedmask.npy (1,X,Y,Z) bool
+      - <out_dir>/<id>_supmask.npy (1,X,Y,Z) bool
+      - <out_dir>/<id>_pseudolabel.npy (1,X,Y,Z) int64 if provided
+      - <out_dir>/<id>_supmask_stats.json summary
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        import nibabel as nib  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError("nibabel is required to load NIfTI selected points/pseudo labels") from e
+
+    import torch
+    import numpy as _np
+    k = 2 * int(dilate_radius) + 1
+
+    for rec in train_list:
+        cid = rec.get("id") or Path(rec["label"]).stem.replace("_label", "")
+        pts_path = selected_points_dir / str(cid) / "mask_selected_points.nii"
+        if not pts_path.exists():
+            print(f"WARNING: selected points mask not found for {cid}: {pts_path}")
+            continue
+        pts_img = nib.load(str(pts_path))
+        pts = pts_img.get_fdata().astype(_np.int64)
+        if pts.ndim != 3:
+            raise RuntimeError(f"Selected points mask must be 3D: {pts_path}")
+        seed = (pts > 0)
+        X, Y, Z = seed.shape
+        seed_t = torch.from_numpy(seed[None, None].astype(_np.float32))
+        sup = torch.nn.functional.max_pool3d(seed_t, kernel_size=k, stride=1, padding=int(dilate_radius)) > 0.5
+        # Save masks
+        safe_id = str(cid).replace('/', '_')
+        _np.save(out_dir / f"{safe_id}_seedmask.npy", seed[None, ...])
+        _np.save(out_dir / f"{safe_id}_supmask.npy", sup[0, 0].cpu().numpy()[None, ...])
+        stats = {
+            "id": cid,
+            "shape": [1, X, Y, Z],
+            "seed_fraction": float(seed.mean()),
+            "sup_fraction": float(sup[0, 0].float().mean().item()),
+            "radius": int(dilate_radius),
+            "source_points": str(pts_path),
+        }
+        (out_dir / f"{safe_id}_supmask_stats.json").write_text(json.dumps(stats, indent=2))
+        # Optional dense pseudo label
+        if pseudo_label_dir is not None:
+            lbl_base = Path(rec["label"]).name
+            pl_path = pseudo_label_dir / lbl_base
+            if pl_path.exists():
+                pl_img = nib.load(str(pl_path))
+                pl = pl_img.get_fdata().astype(_np.int64)
+                if pl.ndim != 3:
+                    raise RuntimeError(f"Pseudo label must be 3D: {pl_path}")
+                _np.save(out_dir / f"{safe_id}_pseudolabel.npy", pl[None, ...])
+            else:
+                print(f"INFO: pseudo label not found for {cid} at {pl_path}; skipping pseudolabel save")
+
+
 def evaluate(
     net: torch.nn.Module,
     dl: DataLoader,
@@ -1359,21 +1506,34 @@ def train(args):
     # Where to save/load static supervision masks
     save_masks_dir = str(out_dir / "sup_masks") if (getattr(args, "save_sup_masks", False) or args.fewshot_static) else None
 
-    # Precompute static global masks if requested (few_points static with global budget)
-    if args.fewshot_mode == "few_points" and args.fewshot_static and getattr(args, "global_budget", True):
+    # Precompute static masks for few_points mode
+    if args.fewshot_mode == "few_points" and args.fewshot_static:
         Path(save_masks_dir).mkdir(parents=True, exist_ok=True)
-        print("Precomputing static few-shot masks with global seed budget across train set...")
-        precompute_static_global_seed_masks(
-            train_list=train_list,
-            masks_dir=Path(save_masks_dir),
-            ratio=args.fewshot_ratio,
-            seed_bg_frac=args.seed_bg_frac,
-            dilate_radius=args.fp_dilate_radius,
-            balance=args.fp_balance,
-            no_overlap=args.fp_no_overlap,
-            dilation_shape=args.dilation_shape,
-            seed=args.seed,
-        )
+        if getattr(args, "selected_points_dir", ""):
+            print("Precomputing static few-shot masks from selected points (raw or dilated seeds)...")
+            pl_dir = Path(args.pseudo_label_dir) if getattr(args, "pseudo_label_dir", "") else None
+            precompute_sup_masks_from_selected_points(
+                train_list=train_list,
+                selected_points_dir=Path(args.selected_points_dir),
+                pseudo_label_dir=pl_dir,
+                out_dir=Path(save_masks_dir),
+                dilate_radius=args.fp_dilate_radius,
+            )
+        elif getattr(args, "global_budget", True):
+            print("Precomputing static few-shot masks with global seed budget across train set...")
+            precompute_static_global_seed_masks(
+                train_list=train_list,
+                masks_dir=Path(save_masks_dir),
+                ratio=args.fewshot_ratio,
+                seed_bg_frac=args.seed_bg_frac,
+                dilate_radius=args.fp_dilate_radius,
+                balance=args.fp_balance,
+                no_overlap=args.fp_no_overlap,
+                dilation_shape=args.dilation_shape,
+                seed=args.seed,
+                sample_mode=getattr(args, "fp_sample_mode", "stratified"),
+                uniform_exclude6=getattr(args, "fp_uniform_exclude6", False),
+            )
 
     t_train, t_val = get_transforms(
         roi=(args.roi_x, args.roi_y, args.roi_z),
@@ -1453,6 +1613,8 @@ def train(args):
         epoch_loss = 0.0
         n_batches = 0
         cov_sum = 0.0
+        cov_sum_seeds = 0.0
+        cov_sum_sup = 0.0
         pl_cov_sum = 0.0
         t0 = time.time()
         for batch in dl_train:
@@ -1489,11 +1651,29 @@ def train(args):
             # Coverage logging
             with torch.no_grad():
                 if args.fewshot_mode == "few_points":
-                    cov_seeds = float(seed_mask.float().mean().item())
-                    cov_sup = float(sup_mask.float().mean().item())
+                    vm = batch.get("valid_mask", None)
+                    if vm is not None:
+                        vm_t = vm.to(device).bool()
+                        # Optionally exclude class 6 from denominator for uniform_all+exclude6 semantics
+                        if getattr(args, "fp_sample_mode", "stratified") == "uniform_all" and getattr(args, "fp_uniform_exclude6", False):
+                            vm_t = vm_t & (lbl != 6)
+                        denom = float(vm_t.sum().item()) if vm_t.numel() > 0 else 0.0
+                        if denom > 0:
+                            cov_seeds = float(((seed_mask & vm_t).float().sum().item()) / denom)
+                            cov_sup = float(((sup_mask & vm_t).float().sum().item()) / denom)
+                        else:
+                            cov_seeds = float(seed_mask.float().mean().item())
+                            cov_sup = float(sup_mask.float().mean().item())
+                    else:
+                        cov_seeds = float(seed_mask.float().mean().item())
+                        cov_sup = float(sup_mask.float().mean().item())
+                    cov_sum_seeds += cov_seeds
+                    cov_sum_sup += cov_sup
                     cov = cov_seeds if getattr(args, "coverage_mode", "sup") == "seeds" else cov_sup
                 else:
                     cov = float(sup_mask.float().mean().item())
+                    cov_sum_seeds += cov
+                    cov_sum_sup += cov
                 cov_sum += cov
 
             logits = net(img)
@@ -1552,19 +1732,16 @@ def train(args):
         dur = time.time() - t0
         avg_loss = epoch_loss / max(n_batches, 1)
         cov_epoch = cov_sum / max(n_batches, 1)
+        cov_seeds_epoch = cov_sum_seeds / max(n_batches, 1)
+        cov_sup_epoch = cov_sum_sup / max(n_batches, 1)
         plcov_epoch = pl_cov_sum / max(n_batches, 1) if args.pl_enable else 0.0
-        # Always print both seed and sup coverage if available
+        # Always print both seed and sup coverage means if using few_points
         extra_cov = ""
         if args.fewshot_mode == "few_points":
-            try:
-                cov_seeds_epoch = float(seed_mask.float().mean().item())
-                cov_sup_epoch = float(sup_mask.float().mean().item())
-                extra_cov = f" - cov_seeds {cov_seeds_epoch:.4f} - cov_sup {cov_sup_epoch:.4f}"
-            except Exception:
-                extra_cov = ""
+            extra_cov = f" - cov_seeds_mean {cov_seeds_epoch:.4f} - cov_sup_mean {cov_sup_epoch:.4f}"
         print(
             f"Epoch {epoch}/{args.epochs} - loss {avg_loss:.4f} - {dur:.1f}s - lr {optimizer.param_groups[0]['lr']:.2e}"
-            + f" - sup_coverage {cov_epoch:.4f}" + extra_cov
+            + f" - avg_cov({getattr(args, 'coverage_mode', 'sup')}) {cov_epoch:.4f}" + extra_cov
             + (f" - pl_coverage {plcov_epoch:.4f}" if args.pl_enable else "")
         )
 
@@ -1618,7 +1795,15 @@ def infer(args):
     ds_test = Dataset(test_list, transform=t_val)
     dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
 
-    net = build_model().to(device)
+    # Build network matching the training architecture
+    if args.bundle_dir:
+        bundle_path = Path(args.bundle_dir)
+        if not bundle_path.exists():
+            raise FileNotFoundError(f"--bundle_dir provided but not found: {bundle_path}")
+        net = build_model_from_bundle(bundle_path, out_channels=5).to(device)
+        print(f"Built network from bundle for inference: {args.bundle_dir}")
+    else:
+        net = build_model(args.net).to(device)
     if args.ckpt and Path(args.ckpt).exists():
         sd = torch.load(args.ckpt, map_location=device)
         sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
@@ -1638,7 +1823,13 @@ def parse_args():
     p.add_argument("--mode", choices=["train", "infer"], default="train", help="Run mode")
     p.add_argument("--data_root", type=str, default="/data3/wp5/wp5-code/dataloaders/wp5-dataset", help="WP5 dataset root (contains data/)")
     p.add_argument("--split_cfg", type=str, default="/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json", help="Predefined split config JSON")
-    p.add_argument("--output_dir", type=str, default="runs/wp5_finetune", help="Output directory")
+    p.add_argument("--output_dir", type=str, default="runs/wp5_finetune", help="Output directory (base path)")
+    p.add_argument(
+        "--train_label_override_dir",
+        type=str,
+        default="",
+        help="Override training label paths with files from this directory (mirror basenames)",
+    )
     p.add_argument("--epochs", type=int, default=100)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
@@ -1686,6 +1877,8 @@ def parse_args():
     p.add_argument("--fp_seed_strategy", type=str, default="random", choices=["random", "boundary"], help="Seed sampling strategy (boundary reserved; currently random)")
     p.add_argument("--fp_no_overlap", action="store_true", help="When sampling seeds, avoid any overlap of their dilation neighborhoods (spreads seeds out)")
     p.add_argument("--dilation_shape", type=str, default="auto", choices=["auto", "cube", "cross"], help="Dilation neighborhood: 'cube' (Chebyshev) or 'cross' (Manhattan); auto uses cross for ratio>=0.1 else cube")
+    p.add_argument("--fp_sample_mode", type=str, default="stratified", choices=["stratified", "uniform_all"], help="Static few_points sampling: 'stratified' (FG/BG split + class balance) or 'uniform_all' (uniform over all voxels)")
+    p.add_argument("--fp_uniform_exclude6", action="store_true", help="When --fp_sample_mode=uniform_all, sample only from voxels with label != 6 (background still included)")
     # Static global budget options
     p.add_argument("--global_budget", action="store_true", default=True, help="Enforce fewshot_ratio globally across the entire train set (seed budget)")
     p.add_argument("--seed_bg_frac", type=float, default=0.10, help="Global seed budget fraction reserved for background (class 0)")
@@ -1710,14 +1903,39 @@ def parse_args():
     p.add_argument("--pl_warmup_epochs", type=int, default=5, help="Number of epochs to skip pseudo-labeling for warm-up")
     # Sup mask persistence
     p.add_argument("--save_sup_masks", action="store_true", help="Save per-volume static supervision masks (few_points + --fewshot_static) to <output_dir>/sup_masks")
+    # Static masks from selected points (1% seeds) and dense pseudo labels
+    p.add_argument(
+        "--selected_points_dir",
+        type=str,
+        default="",
+        help="Directory containing per-case selected points (mask_selected_points.nii under <id>/)",
+    )
+    p.add_argument(
+        "--pseudo_label_dir",
+        type=str,
+        default="",
+        help="Directory containing dense pseudo labels mirroring original label filenames",
+    )
     # Coverage logging mode
     p.add_argument("--coverage_mode", type=str, default="sup", choices=["sup", "seeds"], help="Report coverage using dilated supervised mask ('sup') or seed points only ('seeds')")
+    # Output directory timestamp control
+    p.add_argument(
+        "--no_timestamp",
+        action="store_true",
+        help="Do not append timestamp to --output_dir (default behavior appends _YYYYmmdd-HHMMSS)",
+    )
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
+    # Append timestamp suffix to avoid overwriting runs unless explicitly disabled
+    if not getattr(args, "no_timestamp", False):
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        base = Path(args.output_dir)
+        args.output_dir = str(base.parent / f"{base.name}_{ts}")
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    print(f"Using output directory: {args.output_dir}")
     if args.mode == "train":
         train(args)
     else:
