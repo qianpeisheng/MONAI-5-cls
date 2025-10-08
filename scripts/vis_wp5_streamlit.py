@@ -40,6 +40,7 @@ except Exception:
 
 try:
     import plotly.graph_objects as go  # type: ignore
+    from plotly.subplots import make_subplots  # type: ignore
 except Exception:
     go = None
 
@@ -165,7 +166,54 @@ def draw_slice(image: np.ndarray, label: Optional[np.ndarray], pred: Optional[np
     st.pyplot(fig, clear_figure=True)
 
 
-def plot_3d(image: np.ndarray, seg: Optional[np.ndarray], cls: int, downsample: int = 2, opacity: float = 0.15):
+def draw_slice_pair(image: np.ndarray, label: Optional[np.ndarray], pred: Optional[np.ndarray], axis: str, index: int, alpha: float):
+    if plt is None:
+        st.warning("matplotlib not installed; 2D view disabled. pip install matplotlib")
+        return
+    # Extract 2D slice
+    if axis == "x":
+        img2d = image[index, :, :]
+        lbl2d = label[index, :, :] if label is not None else None
+        prd2d = pred[index, :, :] if pred is not None else None
+    elif axis == "y":
+        img2d = image[:, index, :]
+        lbl2d = label[:, index, :] if label is not None else None
+        prd2d = pred[:, index, :] if pred is not None else None
+    else:  # z
+        img2d = image[:, :, index]
+        lbl2d = label[:, :, index] if label is not None else None
+        prd2d = pred[:, :, index] if pred is not None else None
+
+    vmin, vmax = robust_minmax(img2d)
+    col1, col2 = st.columns(2)
+    with col1:
+        fig1, ax1 = plt.subplots(1, 1, figsize=(5, 5))
+        ax1.set_title("Ground Truth")
+        ax1.imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+        if lbl2d is not None:
+            ax1.imshow(colorize_seg2d(lbl2d.T, alpha=alpha), origin="lower")
+        ax1.axis("off")
+        st.pyplot(fig1, clear_figure=True)
+    with col2:
+        fig2, ax2 = plt.subplots(1, 1, figsize=(5, 5))
+        ax2.set_title("Prediction")
+        ax2.imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+        if prd2d is not None:
+            ax2.imshow(colorize_seg2d(prd2d.T, alpha=alpha), origin="lower")
+        ax2.axis("off")
+        st.pyplot(fig2, clear_figure=True)
+
+
+def normalize_image_for_volume(image: np.ndarray) -> np.ndarray:
+    # Robust normalize to [0,1]
+    lo, hi = robust_minmax(image)
+    im = image.astype(np.float32)
+    if hi > lo:
+        return (im - lo) / (hi - lo)
+    return np.zeros_like(im, dtype=np.float32)
+
+
+def plot_3d(image: np.ndarray, seg: Optional[np.ndarray], cls: int, downsample: int = 2, opacity: float = 0.15, show_image: bool = False):
     if go is None:
         st.warning("plotly not installed; 3D view disabled. pip install plotly")
         return
@@ -175,27 +223,22 @@ def plot_3d(image: np.ndarray, seg: Optional[np.ndarray], cls: int, downsample: 
             return v
         return v[::downsample, ::downsample, ::downsample]
 
-    # Normalize image to [0,1] for stable volume rendering
-    img_ds = ds(image.astype(np.float32))
-    lo, hi = robust_minmax(img_ds)
-    if hi > lo:
-        img_norm = (img_ds - lo) / (hi - lo)
-    else:
-        img_norm = img_ds * 0.0
+    img_ds = ds(normalize_image_for_volume(image))
     fig = go.Figure()
-    fig.add_trace(
-        go.Volume(
-            value=img_norm,
-            opacity=0.12,
-            surface_count=12,
-            colorscale="Gray",
-            showscale=False,
-            isomin=0.0,
-            isomax=1.0,
-            opacityscale=[[0.0, 0.0], [0.2, 0.0], [1.0, 1.0]],
-            caps=dict(x_show=False, y_show=False, z_show=False),
+    if show_image:
+        fig.add_trace(
+            go.Volume(
+                value=img_ds,
+                opacity=0.12,
+                surface_count=12,
+                colorscale="Gray",
+                showscale=False,
+                isomin=0.0,
+                isomax=1.0,
+                opacityscale=[[0.0, 0.0], [0.2, 0.0], [1.0, 1.0]],
+                caps=dict(x_show=False, y_show=False, z_show=False),
+            )
         )
-    )
     if seg is not None and cls in (1, 2, 3, 4):
         mask = (seg == cls).astype(np.float32)
         mask_ds = ds(mask)
@@ -216,6 +259,86 @@ def plot_3d(image: np.ndarray, seg: Optional[np.ndarray], cls: int, downsample: 
             )
         )
     fig.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def plot_3d_pair(image: np.ndarray, gt: Optional[np.ndarray], pred: Optional[np.ndarray], cls: int, downsample: int = 2, opacity: float = 0.25, show_image: bool = False):
+    if go is None:
+        st.warning("plotly not installed; 3D view disabled. pip install plotly")
+        return
+    # Downsample helper
+    def ds(v):
+        if downsample <= 1:
+            return v
+        return v[::downsample, ::downsample, ::downsample]
+
+    img_ds = ds(normalize_image_for_volume(image))
+    specs = [[{"type": "scene"}, {"type": "scene"}]]
+    fig = make_subplots(rows=1, cols=2, specs=specs, subplot_titles=("GT", "Prediction"))
+
+    if show_image:
+        for col in (1, 2):
+            fig.add_trace(
+                go.Volume(
+                    value=img_ds,
+                    opacity=0.10,
+                    surface_count=8,
+                    colorscale="Gray",
+                    showscale=False,
+                    isomin=0.0,
+                    isomax=1.0,
+                    opacityscale=[[0.0, 0.0], [0.2, 0.0], [1.0, 1.0]],
+                    caps=dict(x_show=False, y_show=False, z_show=False),
+                ),
+                row=1, col=col,
+            )
+
+    # GT isosurface
+    if gt is not None and cls in (1, 2, 3, 4):
+        gmask = (gt == cls).astype(np.float32)
+        if gmask.sum() > 0:
+            fig.add_trace(
+                go.Isosurface(
+                    value=ds(gmask),
+                    isomin=0.5,
+                    isomax=1.0,
+                    surface_count=1,
+                    opacity=opacity,
+                    colorscale=[[0, "green"], [1, "green"]],
+                    showscale=False,
+                    caps=dict(x_show=False, y_show=False, z_show=False),
+                ),
+                row=1, col=1,
+            )
+        else:
+            st.info(f"No GT voxels for class {cls} in this case.")
+
+    # Pred isosurface
+    if pred is not None and cls in (1, 2, 3, 4):
+        pmask = (pred == cls).astype(np.float32)
+        if pmask.sum() > 0:
+            fig.add_trace(
+                go.Isosurface(
+                    value=ds(pmask),
+                    isomin=0.5,
+                    isomax=1.0,
+                    surface_count=1,
+                    opacity=opacity,
+                    colorscale=[[0, "red"], [1, "red"]],
+                    showscale=False,
+                    caps=dict(x_show=False, y_show=False, z_show=False),
+                ),
+                row=1, col=2,
+            )
+        else:
+            st.info(f"No Pred voxels for class {cls} in this case.")
+
+    # Layout
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=30, b=0),
+        scene=dict(aspectmode="data"),
+        scene2=dict(aspectmode="data"),
+    )
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -281,7 +404,10 @@ def main():
     dim = {"x": 0, "y": 1, "z": 2}[axis]
     size = int(img_vol.shape[dim])
     idx = st.slider("Slice index", 0, max(0, size - 1), size // 2)
-    draw_slice(img_vol, lbl_vol, pred_vol, axis, idx, alpha)
+    # Show separate GT/Pred overlays side-by-side
+    draw_slice_pair(img_vol, lbl_vol, pred_vol, axis, idx, alpha)
+    with st.expander("Show combined overlay (image + GT + Pred)"):
+        draw_slice(img_vol, lbl_vol, pred_vol, axis, idx, alpha)
 
     # 3D viewer (optional)
     st.subheader("3D View (Plotly)")
@@ -290,9 +416,9 @@ def main():
     else:
         cls = st.selectbox("Class isosurface (1-4)", options=[1, 2, 3, 4], index=1)
         ds = st.slider("Downsample (higher=faster)", 1, 6, 3)
-        op = st.slider("Surface opacity", 0.05, 0.8, 0.2, 0.05)
-        seg_for_3d = pred_vol if pred_vol is not None else lbl_vol
-        plot_3d(img_vol, seg_for_3d, cls=cls, downsample=ds, opacity=op)
+        op = st.slider("Surface opacity", 0.05, 0.8, 0.25, 0.05)
+        show_img_vol = st.checkbox("Show underlying image volume", value=False)
+        plot_3d_pair(img_vol, lbl_vol, pred_vol, cls=cls, downsample=ds, opacity=op, show_image=show_img_vol)
 
     # Metrics (optional)
     if not metrics_path:
