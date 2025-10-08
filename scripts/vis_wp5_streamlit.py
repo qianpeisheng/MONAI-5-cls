@@ -391,12 +391,38 @@ def plot_3d_pair(image: np.ndarray, gt: Optional[np.ndarray], pred: Optional[np.
 def extract_mesh_from_mask(mask3d: np.ndarray, step: int = 2) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     if skmeasure is None:
         return None
-    # marching_cubes requires values in [0,1], we pass mask floats
-    try:
-        verts, faces, _, _ = skmeasure.marching_cubes(mask3d.astype(np.float32), level=0.5, step_size=max(1, int(step)))
-        return verts, faces
-    except Exception:
+    m = (mask3d.astype(np.uint8) > 0)
+    # Ensure non-empty and at least some zeros and ones for a surface to exist
+    voxels = int(m.sum())
+    if voxels == 0:
         return None
+    # Add 1-voxel zero padding around to avoid boundary artifacts
+    m = np.pad(m, 1, mode='constant', constant_values=0)
+    vol = m.astype(np.float32)
+    step_sz = max(1, int(step))
+    # Try modern API first
+    try:
+        verts, faces, _, _ = skmeasure.marching_cubes(
+            vol, level=0.5, step_size=step_sz, allow_degenerate=True, method='lewiner'
+        )
+        return verts, faces
+    except TypeError:
+        # Older scikit-image without allow_degenerate/method
+        try:
+            verts, faces, _, _ = skmeasure.marching_cubes(vol, level=0.5, step_size=step_sz)
+            return verts, faces
+        except Exception:
+            pass
+    except Exception:
+        # Try legacy function
+        try:
+            mc_legacy = getattr(skmeasure, 'marching_cubes_lewiner', None)
+            if mc_legacy is not None:
+                verts, faces, _, _ = mc_legacy(vol, level=0.5, step_size=step_sz)
+                return verts, faces
+        except Exception:
+            pass
+    return None
 
 
 def plot_3d_pair_matplotlib(gt: Optional[np.ndarray], pred: Optional[np.ndarray], cls: int, downsample: int = 2, opacity: float = 0.5):
@@ -428,7 +454,15 @@ def plot_3d_pair_matplotlib(gt: Optional[np.ndarray], pred: Optional[np.ndarray]
                     verts, faces = mesh
                     ax.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color='green', linewidth=0.1, antialiased=True, alpha=opacity)
                 else:
-                    st.info("Failed to extract GT mesh (marching cubes)")
+                    # Fallback: scatter a subset of voxels to indicate shape
+                    idx = np.column_stack(np.nonzero(gmask))
+                    if idx.shape[0] > 0:
+                        sel = idx
+                        if idx.shape[0] > 5000:
+                            perm = np.random.RandomState(0).permutation(idx.shape[0])[:5000]
+                            sel = idx[perm]
+                        ax.scatter(sel[:, 0], sel[:, 1], sel[:, 2], s=1, c='green', alpha=min(0.8, opacity+0.2))
+                        st.info("GT: using point-cloud fallback (mesh extraction failed)")
             else:
                 st.info("No GT voxels for selected class.")
         ax.set_axis_off()
@@ -448,7 +482,15 @@ def plot_3d_pair_matplotlib(gt: Optional[np.ndarray], pred: Optional[np.ndarray]
                     verts, faces = mesh
                     ax.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color='red', linewidth=0.1, antialiased=True, alpha=opacity)
                 else:
-                    st.info("Failed to extract Pred mesh (marching cubes)")
+                    # Fallback: scatter subset of pred voxels
+                    idx = np.column_stack(np.nonzero(pmask))
+                    if idx.shape[0] > 0:
+                        sel = idx
+                        if idx.shape[0] > 5000:
+                            perm = np.random.RandomState(0).permutation(idx.shape[0])[:5000]
+                            sel = idx[perm]
+                        ax.scatter(sel[:, 0], sel[:, 1], sel[:, 2], s=1, c='red', alpha=min(0.8, opacity+0.2))
+                        st.info("Pred: using point-cloud fallback (mesh extraction failed)")
             else:
                 st.info("No Pred voxels for selected class.")
         ax.set_axis_off()
