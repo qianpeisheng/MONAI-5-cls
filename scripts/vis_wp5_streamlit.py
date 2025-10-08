@@ -107,6 +107,11 @@ def load_nii(path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         st.error("nibabel not installed. pip install nibabel")
         st.stop()
     img = nib.load(str(path))
+    # Canonicalize to RAS to match training/eval Orientationd(axcodes='RAS')
+    try:
+        img = nib.as_closest_canonical(img)
+    except Exception:
+        pass
     arr = img.get_fdata()
     return arr, getattr(img, "affine", None)
 
@@ -121,6 +126,41 @@ def load_volume_any(path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         return arr, None
     else:
         return load_nii(path)
+
+
+def center_pad_or_crop(vol: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
+    """Center pad or crop a 3D volume to the target shape using nearest-neighbor semantics.
+    Keeps integer labels intact when used on segmentations.
+    """
+    import numpy as _np
+
+    def _crop_to(v, ts):
+        out = v
+        for axis in range(3):
+            diff = out.shape[axis] - ts[axis]
+            if diff > 0:
+                start = diff // 2
+                end = start + ts[axis]
+                slicer = [slice(None)] * out.ndim
+                slicer[axis] = slice(start, end)
+                out = out[tuple(slicer)]
+        return out
+
+    def _pad_to(v, ts):
+        pad_width = []
+        for axis in range(3):
+            diff = ts[axis] - v.shape[axis]
+            if diff > 0:
+                left = diff // 2
+                right = diff - left
+                pad_width.append((left, right))
+            else:
+                pad_width.append((0, 0))
+        return _np.pad(v, pad_width, mode='constant', constant_values=0)
+
+    out = _crop_to(vol, target_shape)
+    out = _pad_to(out, target_shape)
+    return out
 
 
 def colorize_seg2d(seg2d: np.ndarray, alpha: float = 0.4) -> np.ndarray:
@@ -468,6 +508,11 @@ def main():
             # ensure segmentation shape is (X,Y,Z)
             if pred_vol.ndim == 4 and pred_vol.shape[0] == 1:
                 pred_vol = pred_vol[0]
+        # Align shapes if needed (center pad/crop)
+        if lbl_vol is not None and lbl_vol.shape != img_vol.shape:
+            lbl_vol = center_pad_or_crop(lbl_vol, img_vol.shape)
+        if pred_vol is not None and pred_vol.shape != img_vol.shape:
+            pred_vol = center_pad_or_crop(pred_vol, img_vol.shape)
         if pred_vol is None:
             st.warning("Prediction not found for this case in pred_dir.")
 
