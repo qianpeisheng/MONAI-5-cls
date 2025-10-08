@@ -44,6 +44,12 @@ try:
 except Exception:
     go = None
 
+# Optional: scikit-image for mesh extraction
+try:
+    from skimage import measure as skmeasure  # type: ignore
+except Exception:
+    skmeasure = None
+
 
 def parse_cli_args():
     ap = argparse.ArgumentParser(add_help=False)
@@ -342,6 +348,73 @@ def plot_3d_pair(image: np.ndarray, gt: Optional[np.ndarray], pred: Optional[np.
     st.plotly_chart(fig, use_container_width=True)
 
 
+def extract_mesh_from_mask(mask3d: np.ndarray, step: int = 2) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if skmeasure is None:
+        return None
+    # marching_cubes requires values in [0,1], we pass mask floats
+    try:
+        verts, faces, _, _ = skmeasure.marching_cubes(mask3d.astype(np.float32), level=0.5, step_size=max(1, int(step)))
+        return verts, faces
+    except Exception:
+        return None
+
+
+def plot_3d_pair_matplotlib(gt: Optional[np.ndarray], pred: Optional[np.ndarray], cls: int, downsample: int = 2, opacity: float = 0.5):
+    if plt is None:
+        st.warning("matplotlib not installed; 3D fallback disabled.")
+        return
+    if skmeasure is None:
+        st.warning("scikit-image not installed. pip install scikit-image for 3D fallback rendering.")
+        return
+
+    # Downsample helper
+    def ds(v):
+        s = max(1, int(downsample))
+        return v[::s, ::s, ::s]
+
+    col1, col2 = st.columns(2)
+
+    # Ground Truth pane
+    with col1:
+        fig = plt.figure(figsize=(5.5, 5.0))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_title(f"GT class {cls}")
+        if gt is not None:
+            gmask = (gt == cls).astype(np.uint8)
+            if gmask.any():
+                gmask = ds(gmask)
+                mesh = extract_mesh_from_mask(gmask, step=max(1, int(downsample)))
+                if mesh is not None:
+                    verts, faces = mesh
+                    ax.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color='green', linewidth=0.1, antialiased=True, alpha=opacity)
+                else:
+                    st.info("Failed to extract GT mesh (marching cubes)")
+            else:
+                st.info("No GT voxels for selected class.")
+        ax.set_axis_off()
+        st.pyplot(fig, clear_figure=True)
+
+    # Prediction pane
+    with col2:
+        fig = plt.figure(figsize=(5.5, 5.0))
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_title(f"Pred class {cls}")
+        if pred is not None:
+            pmask = (pred == cls).astype(np.uint8)
+            if pmask.any():
+                pmask = ds(pmask)
+                mesh = extract_mesh_from_mask(pmask, step=max(1, int(downsample)))
+                if mesh is not None:
+                    verts, faces = mesh
+                    ax.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color='red', linewidth=0.1, antialiased=True, alpha=opacity)
+                else:
+                    st.info("Failed to extract Pred mesh (marching cubes)")
+            else:
+                st.info("No Pred voxels for selected class.")
+        ax.set_axis_off()
+        st.pyplot(fig, clear_figure=True)
+
+
 def main():
     args = parse_cli_args()
 
@@ -410,15 +483,19 @@ def main():
         draw_slice(img_vol, lbl_vol, pred_vol, axis, idx, alpha)
 
     # 3D viewer (optional)
-    st.subheader("3D View (Plotly)")
-    if go is None:
-        st.info("Install plotly for 3D view: pip install plotly")
+    st.subheader("3D View")
+    cls = st.selectbox("Class isosurface (1-4)", options=[1, 2, 3, 4], index=1)
+    ds = st.slider("Downsample (higher=faster)", 1, 6, 3)
+    op = st.slider("Surface opacity", 0.05, 0.95, 0.5, 0.05)
+    renderer = st.radio("Renderer", options=["Matplotlib (static)", "Plotly (interactive)"] , index=0, horizontal=True)
+    if renderer.startswith("Plotly"):
+        if go is None:
+            st.info("Install plotly for 3D view: pip install plotly")
+        else:
+            show_img_vol = st.checkbox("Show underlying image volume", value=False)
+            plot_3d_pair(img_vol, lbl_vol, pred_vol, cls=cls, downsample=ds, opacity=op, show_image=show_img_vol)
     else:
-        cls = st.selectbox("Class isosurface (1-4)", options=[1, 2, 3, 4], index=1)
-        ds = st.slider("Downsample (higher=faster)", 1, 6, 3)
-        op = st.slider("Surface opacity", 0.05, 0.8, 0.25, 0.05)
-        show_img_vol = st.checkbox("Show underlying image volume", value=False)
-        plot_3d_pair(img_vol, lbl_vol, pred_vol, cls=cls, downsample=ds, opacity=op, show_image=show_img_vol)
+        plot_3d_pair_matplotlib(lbl_vol, pred_vol, cls=cls, downsample=ds, opacity=op)
 
     # Metrics (optional)
     if not metrics_path:
