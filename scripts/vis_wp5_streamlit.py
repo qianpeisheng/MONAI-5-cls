@@ -68,16 +68,31 @@ def robust_minmax(vol: np.ndarray, pmin=1, pmax=99) -> Tuple[float, float]:
 
 
 def find_pred_path(pred_dir: Path, image_path: Path, case_id: str) -> Optional[Path]:
-    # Heuristic 1: image basename + _pred.nii.gz
+    # Normalize base name without .nii/.nii.gz
     base = image_path.name
-    candidate = pred_dir / (base.replace(".nii", "").replace(".gz", "") + "_pred.nii.gz")
-    if candidate.exists():
-        return candidate
-    # Heuristic 2: any file in pred_dir that contains the case_id and 'pred'
-    for p in pred_dir.glob("*pred*.nii*"):
-        if case_id in p.name:
-            return p
-    return None
+    base_no_ext = base
+    if base_no_ext.endswith('.nii.gz'):
+        base_no_ext = base_no_ext[:-7]
+    elif base_no_ext.endswith('.nii'):
+        base_no_ext = base_no_ext[:-4]
+
+    # Heuristic 1: exact base + _pred with nii.gz or npy
+    cand_nii = pred_dir / f"{base_no_ext}_pred.nii.gz"
+    cand_npy = pred_dir / f"{base_no_ext}_pred.npy"
+    if cand_nii.exists():
+        return cand_nii
+    if cand_npy.exists():
+        return cand_npy
+
+    # Heuristic 2: files that contain the case_id and 'pred' (nii or npy)
+    for pattern in ("*pred*.nii*", "*pred*.npy"):
+        for p in pred_dir.glob(pattern):
+            if case_id and case_id in p.name:
+                return p
+
+    # Heuristic 3: fallback to first pred* file
+    any_pred = sorted(list(pred_dir.glob("*pred*.nii*")) + list(pred_dir.glob("*pred*.npy")))
+    return any_pred[0] if any_pred else None
 
 
 def load_nii(path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
@@ -87,6 +102,18 @@ def load_nii(path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
     img = nib.load(str(path))
     arr = img.get_fdata()
     return arr, getattr(img, "affine", None)
+
+
+def load_volume_any(path: Path) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    s = path.suffix.lower()
+    if s == ".npy" or path.name.endswith(".npy"):
+        arr = np.load(str(path))
+        # squeeze leading channel dim if present
+        if arr.ndim == 4 and arr.shape[0] == 1:
+            arr = arr[0]
+        return arr, None
+    else:
+        return load_nii(path)
 
 
 def colorize_seg2d(seg2d: np.ndarray, alpha: float = 0.4) -> np.ndarray:
@@ -148,17 +175,24 @@ def plot_3d(image: np.ndarray, seg: Optional[np.ndarray], cls: int, downsample: 
             return v
         return v[::downsample, ::downsample, ::downsample]
 
-    img_ds = ds(image)
+    # Normalize image to [0,1] for stable volume rendering
+    img_ds = ds(image.astype(np.float32))
     lo, hi = robust_minmax(img_ds)
+    if hi > lo:
+        img_norm = (img_ds - lo) / (hi - lo)
+    else:
+        img_norm = img_ds * 0.0
     fig = go.Figure()
     fig.add_trace(
         go.Volume(
-            value=img_ds.astype(np.float32),
+            value=img_norm,
             opacity=0.12,
             surface_count=12,
             colorscale="Gray",
             showscale=False,
-            opacityscale=[[0, 0.0], [0.2, 0.0], [1.0, 1.0]],
+            isomin=0.0,
+            isomax=1.0,
+            opacityscale=[[0.0, 0.0], [0.2, 0.0], [1.0, 1.0]],
             caps=dict(x_show=False, y_show=False, z_show=False),
         )
     )
@@ -234,7 +268,10 @@ def main():
         st.write(f"Prediction: {pred_path}")
         pred_vol = None
         if pred_path and pred_path.exists():
-            pred_vol, _ = load_nii(pred_path)
+            pred_vol, _ = load_volume_any(pred_path)
+            # ensure segmentation shape is (X,Y,Z)
+            if pred_vol.ndim == 4 and pred_vol.shape[0] == 1:
+                pred_vol = pred_vol[0]
         if pred_vol is None:
             st.warning("Prediction not found for this case in pred_dir.")
 
@@ -276,4 +313,3 @@ def main():
 if __name__ == "__main__":
     # Streamlit entry
     main()
-
