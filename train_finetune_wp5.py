@@ -755,7 +755,8 @@ def get_transforms(
         # sliding_window_inference pads internally as needed and returns the original spatial size.
         if training:
             pad_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
-            seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi))
+            # Allow optional keys to be absent (e.g., pseudo_label may not exist for sparse points)
+            seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi, allow_missing_keys=True))
         # Optional intensity augmentations (training only)
         if training and aug_intensity:
             seq.extend(
@@ -768,17 +769,18 @@ def get_transforms(
         if include_aug:
             flip_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
             seq.extend([
-                RandFlipd(keys=flip_keys, spatial_axis=0, prob=0.5),
-                RandFlipd(keys=flip_keys, spatial_axis=1, prob=0.5),
-                RandFlipd(keys=flip_keys, spatial_axis=2, prob=0.5),
+                RandFlipd(keys=flip_keys, spatial_axis=0, prob=0.5, allow_missing_keys=True),
+                RandFlipd(keys=flip_keys, spatial_axis=1, prob=0.5, allow_missing_keys=True),
+                RandFlipd(keys=flip_keys, spatial_axis=2, prob=0.5, allow_missing_keys=True),
             ])
         if include_crop:
             if fg_crop_prob > 0.0 and training:
                 crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
+                # Custom crop transform already tolerates missing keys
                 seq.append(FGBiasedCropD(keys=crop_keys, roi_size=roi, prob=fg_crop_prob, margin=fg_crop_margin))
             else:
                 crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
-                seq.append(RandSpatialCropd(keys=crop_keys, roi_size=roi, random_size=False))
+                seq.append(RandSpatialCropd(keys=crop_keys, roi_size=roi, random_size=False, allow_missing_keys=True))
         return seq
 
     train = Compose(build_seq(include_crop=True, include_aug=True, training=True))
