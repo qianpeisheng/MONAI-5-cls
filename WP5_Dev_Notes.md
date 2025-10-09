@@ -93,3 +93,42 @@ References
 
 - Source ideas for normalization: `/data3/wp5/wp5-code/dataloaders/wp5.py` (`get_normalization_transform('clip_zscore', per_sample=True)`).
 - Policy reference: `WP5_Segmentation_Data_Guide.md` (robust per-sample normalization and ignore class 6).
+
+---
+
+Additions and fixes — 2025-10-09
+
+- Configurable evaluation of both-empty cases
+  - New CLI flag `--empty_pair_policy {exclude,count_as_one}` controls how per-class metrics aggregate cases where both prediction and GT are empty:
+    - `exclude` (default): skip such cases from the average (prevents rare-class inflation).
+    - `count_as_one`: treat such cases as perfect (old behavior used in some baselines).
+  - Plumbed through both training-time quick eval and inference-time eval.
+  - Files: `train_finetune_wp5.py` (`compute_metrics`, `evaluate`, CLI arg parsing).
+
+- Orientation-safe mask precompute in static few-points
+  - Internal loader for labels when precomputing static seed/supervision masks now uses MONAI `LoadImaged+Orientationd(axcodes='RAS')` for consistency with train-time transforms.
+  - File: `train_finetune_wp5.py` (`_load_label_volume`).
+
+- Old-semantics evaluator script
+  - New helper: `scripts/eval_wp5_old_semantics.py` to re-evaluate existing predictions with the old both-empty=1 convention.
+  - Usage:
+    - `python scripts/eval_wp5_old_semantics.py --pred_dir <run>/preds --datalist datalist_test.json --out <run>/metrics/summary_old_semantics.json`.
+
+- Streamlit viewer: few-shot comparison
+  - Added a second predictions directory input to compare fully supervised vs few-shot outputs side-by-side (+GT) in 2D and 3D.
+  - Default dirs:
+    - Fully supervised: `/home/peisheng/MONAI/runs/grid_clip_zscore/pretrained_subset_100_eval/preds`.
+    - Few-shot 0.001%: `/home/peisheng/MONAI/runs/fixed_points_scratch50/ratio_0.00001_infer_20251009-154947/preds`.
+  - Files: `scripts/vis_wp5_streamlit.py` (adds `--pred_dir2`, triplet 2D view, dual 3D view, per-class Dice per pred).
+
+- Extreme few-points run scripts
+  - New: `scripts/run_fixed_points_ratio_1e6.sh` to run ratio=1e-6 (0.000001) few-points from scratch on a chosen GPU.
+  - Updated: `scripts/run_fixed_points_bundle_extremes_50ep.sh` now runs from scratch (BasicUNet), launches two ratios concurrently, and writes to stable output dirs.
+
+- Training loop robustness
+  - Fixed an indentation bug around per-epoch evaluation in `train_finetune_wp5.py`.
+
+Notes
+
+- These changes keep MONAI idioms and WP5 label policy (ignore class 6) intact.
+- For few-points `uniform_all` sampling with ignore-6, consider `--fp_uniform_exclude6` to avoid allocating seeds to class 6.

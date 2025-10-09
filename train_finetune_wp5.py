@@ -4,7 +4,7 @@ WP5 fine-tuning script (full or partial data) with reproducible training, per-ep
 
 Usage examples:
 
-Train on full data and evaluate each epoch:
+Train on full data and evaluate each epoch (defaults: BasicUNet, scratch init):
   python train_finetune_wp5.py --mode train \
     --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
     --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
@@ -14,7 +14,7 @@ Train on 10% (deterministic subset) and evaluate:
   python train_finetune_wp5.py --mode train \
     --subset_ratio 0.1 --seed 42 --output_dir runs/wp5_finetune_10pct
 
-Train from a pretrained checkpoint (non-strict load for head):
+Optionally, train from a pretrained checkpoint (non-strict load for head):
   python train_finetune_wp5.py --mode train \
     --init pretrained --pretrained_ckpt path/to/pretrained.ckpt \
     --output_dir runs/wp5_finetune_pretrained
@@ -137,27 +137,23 @@ def subset_datalist(datalist: List[Dict], ratio: float, seed: int) -> List[Dict]
 
 
 def _load_label_volume(path: str) -> np.ndarray:
-    """Load label volume with nibabel fallback; channel-first (1,X,Y,Z), int64."""
-    try:
-        import nibabel as nib
-        img = nib.load(path)
-        arr = img.get_fdata(dtype=np.float32)
-        arr = arr.astype(np.int64)
-        if arr.ndim == 3:
-            arr = arr[None, ...]
-        return arr
-    except Exception:
-        # Fallback: use MONAI transforms to load and orient
-        from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, Orientationd
-        data = {"label": path}
-        t = Compose([
-            LoadImaged(keys=["label"]),
-            EnsureChannelFirstd(keys=["label"]),
-            Orientationd(keys=["label"], axcodes="RAS"),
-        ])
-        d = t(data)
-        arr = d["label"].astype(np.int64)
-        return arr
+    """Load label volume using MONAI loader to ensure RAS orientation.
+
+    Returns channel-first array (1,X,Y,Z), dtype int64.
+    Using MONAI's LoadImaged + EnsureChannelFirstd + Orientationd provides
+    consistent orientation with the training pipeline, avoiding mismatches
+    with any nibabel default orientation.
+    """
+    from monai.transforms import Compose as _Compose, LoadImaged as _LoadImaged, EnsureChannelFirstd as _EnsureChannelFirstd, Orientationd as _Orientationd
+    data = {"label": path}
+    t = _Compose([
+        _LoadImaged(keys=["label"]),
+        _EnsureChannelFirstd(keys=["label"]),
+        _Orientationd(keys=["label"], axcodes="RAS"),
+    ])
+    d = t(data)
+    arr = d["label"].astype(np.int64)
+    return arr
 
 
 def precompute_static_global_seed_masks(
@@ -790,7 +786,7 @@ def get_transforms(
 
 def build_model(arch: str = "basicunet") -> torch.nn.Module:
     """Build segmentation network.
-    Default to BasicUNet to match MONAI spleen_ct_segmentation bundle family.
+    Default: BasicUNet (3D) trained from scratch, which is the preferred/baseline model.
     """
     if arch == "basicunet":
         # BasicUNet default features are (32, 64, 128, 256, 512, 32)
@@ -955,10 +951,20 @@ def dice_loss_masked(logits: torch.Tensor, target: torch.Tensor, ignore_mask: to
     return loss
 
 
-def compute_metrics(pred: torch.Tensor, gt: torch.Tensor, heavy: bool = True) -> Dict[int, Dict[str, float]]:
+def compute_metrics(
+    pred: torch.Tensor,
+    gt: torch.Tensor,
+    heavy: bool = True,
+    empty_pair_policy: str = "exclude",
+) -> Dict[int, Dict[str, float]]:
     """Compute per-class Dice, IoU, and optionally HD/ASD for classes 0..4; ignore class 6.
-    pred: (B,1,X,Y,Z), gt: (B,1,X,Y,Z)
-    Returns mapping class->metrics.
+
+    Parameters
+    - pred, gt: shaped (B,1,X,Y,Z)
+    - heavy: include HD/ASD if True
+    - empty_pair_policy:
+        - "exclude": samples where both pred and GT are empty for a class are skipped in averaging
+        - "count_as_one": those samples contribute 1.0 to Dice/IoU
     """
     B = pred.shape[0]
     ignore_mask = (gt != 6)
@@ -982,38 +988,55 @@ def compute_metrics(pred: torch.Tensor, gt: torch.Tensor, heavy: bool = True) ->
         psum = pm.sum(axis=(1, 2, 3))
         gsum = gm.sum(axis=(1, 2, 3))
         uni = (pm | gm).sum(axis=(1, 2, 3))
-        dice = np.where(psum + gsum > 0, (2 * inter) / (psum + gsum + 1e-8), 1.0)
-        iou = np.where(uni > 0, inter / (uni + 1e-8), 1.0)
+
+        both_empty = (psum + gsum) == 0
+        valid = ~both_empty
+        dice = np.full(pred.shape[0], np.nan, dtype=np.float32)
+        iou = np.full(pred.shape[0], np.nan, dtype=np.float32)
+        # computed where valid
+        dice[valid] = (2.0 * inter[valid]) / (psum[valid] + gsum[valid] + 1e-8)
+        iou_valid = uni[valid] > 0
+        iou_vals = np.zeros_like(inter[valid], dtype=np.float32)
+        iou_vals[iou_valid] = inter[valid][iou_valid] / (uni[valid][iou_valid] + 1e-8)
+        iou[valid] = iou_vals
+        # handle both-empty policy
+        if empty_pair_policy == "count_as_one":
+            dice[both_empty] = 1.0
+            iou[both_empty] = 1.0
 
         if heavy:
             # HD & ASD handling for empties
-            hd_vals = np.zeros(B, dtype=np.float32)
-            asd_vals = np.zeros(B, dtype=np.float32)
+            hd_vals = np.full(B, np.nan, dtype=np.float32)
+            asd_vals = np.full(B, np.nan, dtype=np.float32)
             for b in range(B):
+                # Skip both-empty and single-empty for HD/ASD aggregation
                 if psum[b] == 0 and gsum[b] == 0:
-                    hd_vals[b] = 0.0
-                    asd_vals[b] = 0.0
-                elif psum[b] == 0 or gsum[b] == 0:
-                    hd_vals[b] = 0.0
-                    asd_vals[b] = 0.0
+                    continue
+                if psum[b] == 0 or gsum[b] == 0:
+                    continue
                 else:
                     pt = torch.from_numpy(pm[b:b+1][None, ...].astype(np.float32))  # (1,1,...)
                     gt_t = torch.from_numpy(gm[b:b+1][None, ...].astype(np.float32))
                     try:
                         hd_vals[b] = float(np.array(hd_metric(pt, gt_t)).reshape(-1)[0])
                     except Exception:
-                        hd_vals[b] = 0.0
+                        hd_vals[b] = np.nan
                     try:
                         asd_vals[b] = float(np.array(asd_metric(pt, gt_t)).reshape(-1)[0])
                     except Exception:
-                        asd_vals[b] = 0.0
-            hd_mean = float(np.mean(hd_vals))
-            asd_mean = float(np.mean(asd_vals))
+                        asd_vals[b] = np.nan
+            hd_mean = float(np.nanmean(hd_vals)) if np.any(~np.isnan(hd_vals)) else None
+            asd_mean = float(np.nanmean(asd_vals)) if np.any(~np.isnan(asd_vals)) else None
         else:
             hd_mean = None
             asd_mean = None
 
-        out[cls] = {"dice": float(np.mean(dice)), "iou": float(np.mean(iou)), "hd": hd_mean, "asd": asd_mean}
+        out[cls] = {
+            "dice": float(np.nanmean(dice)) if np.any(~np.isnan(dice)) else 0.0,
+            "iou": float(np.nanmean(iou)) if np.any(~np.isnan(iou)) else 0.0,
+            "hd": hd_mean,
+            "asd": asd_mean,
+        }
 
     return out
 
@@ -1397,6 +1420,7 @@ def evaluate(
     save_preds: bool = False,
     max_cases: int | None = None,
     heavy: bool = True,
+    empty_pair_policy: str = "exclude",
 ) -> Dict[str, Dict]:
     net.eval()
     metrics_dir = out_dir / "metrics"
@@ -1455,7 +1479,7 @@ def evaluate(
                             base = f"case_{i}_{b}"
                         np.save(pred_dir / f"{base}_pred.npy", pred[b].cpu().numpy())
 
-            per_class = compute_metrics(pred.cpu(), gt.cpu(), heavy=heavy)
+            per_class = compute_metrics(pred.cpu(), gt.cpu(), heavy=heavy, empty_pair_policy=empty_pair_policy)
             for c in classes:
                 sums[c]["dice"] += per_class[c]["dice"]
                 sums[c]["iou"] += per_class[c]["iou"]
@@ -1748,7 +1772,16 @@ def train(args):
         )
 
         # Evaluate on test set (fast: skip HD/ASD to keep GPU utilization higher)
-        metrics = evaluate(net, dl_test, device, out_dir, save_preds=False, max_cases=None, heavy=False)
+        metrics = evaluate(
+            net,
+            dl_test,
+            device,
+            out_dir,
+            save_preds=False,
+            max_cases=None,
+            heavy=False,
+            empty_pair_policy=getattr(args, "empty_pair_policy", "exclude"),
+        )
         avg_dice = metrics["average"]["dice"]
         # Save epoch metrics
         epoch_metrics_path = out_dir / "metrics" / f"epoch_{epoch:03d}.json"
@@ -1815,7 +1848,16 @@ def infer(args):
         print("No valid checkpoint provided; running with randomly initialized weights.")
 
     # Full metrics (including HD/ASD) during inference
-    metrics = evaluate(net, dl_test, device, out_dir, save_preds=args.save_preds, max_cases=None, heavy=True)
+    metrics = evaluate(
+        net,
+        dl_test,
+        device,
+        out_dir,
+        save_preds=args.save_preds,
+        max_cases=None,
+        heavy=True,
+        empty_pair_policy=getattr(args, "empty_pair_policy", "exclude"),
+    )
     (out_dir / "metrics" / "summary.json").write_text(json.dumps(metrics, indent=2))
     print("Inference complete. Metrics saved.")
 
@@ -1849,12 +1891,19 @@ def parse_args():
         choices=["clip_zscore", "fixed_wp5", "none"],
         help="Image normalization: 'clip_zscore' (p1/p99 clip + z-score), 'fixed_wp5' ([-3,8.5] -> [0,1]), or 'none'",
     )
-    p.add_argument("--net", choices=["basicunet", "unet"], default="basicunet", help="Backbone architecture")
+    p.add_argument("--net", choices=["basicunet", "unet"], default="basicunet", help="Backbone architecture (default and recommended: basicunet from scratch)")
     p.add_argument("--init", choices=["scratch", "pretrained"], default="scratch", help="Initialize randomly or load a pretrained checkpoint")
     p.add_argument("--pretrained_ckpt", type=str, default="", help="Checkpoint to initialize weights when --init pretrained")
     p.add_argument("--bundle_dir", type=str, default="", help="Path to MONAI bundle directory (with configs/ and models/)")
     p.add_argument("--ckpt", type=str, default="", help="Checkpoint to load for inference")
     p.add_argument("--save_preds", action="store_true", help="Save predictions during inference")
+    p.add_argument(
+        "--empty_pair_policy",
+        type=str,
+        default="exclude",
+        choices=["exclude", "count_as_one"],
+        help="When both pred and GT are empty for a class in a sample: 'exclude' (skip from averaging) or 'count_as_one' (score 1.0)",
+    )
     # Few-shot configuration
     p.add_argument(
         "--fewshot_mode",
