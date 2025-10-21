@@ -5,13 +5,11 @@ Streamlit visualization for WP5 3D segmentations.
 Features:
 - Browse cases from a datalist (JSON of {image,label,id}).
 - Show 2D slices with overlays for ground-truth labels and predictions.
-- Optional 3D view using Plotly (isosurface per selected class, downsampled).
-- Displays summary metrics if a metrics JSON is available.
+- Optional 3D view using Plotly or Matplotlib (isosurface per selected class).
+- Compares four fixed runs: Fully, 1% Volume, 1% Slice, 1% Voxel.
 
 Launch:
-  streamlit run scripts/vis_wp5_streamlit.py -- \
-    --pred_dir runs/grid_clip_zscore/scratch_subset_100_eval/preds \
-    --datalist datalist_test.json
+  streamlit run scripts/vis_wp5_streamlit.py
 
 Requirements: streamlit, numpy, nibabel, matplotlib, plotly
   pip install streamlit numpy nibabel matplotlib plotly
@@ -19,7 +17,6 @@ Requirements: streamlit, numpy, nibabel, matplotlib, plotly
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -50,37 +47,21 @@ try:
 except Exception:
     skmeasure = None
 
+# Fixed configuration for this app (no user-controlled folders)
+DATALIST_PATH = Path("/home/peisheng/MONAI/datalist_test.json")
+RUNS = {
+    "Fully Supervised": Path("/home/peisheng/MONAI/runs/grid_clip_zscore/scratch_subset_100/eval_20251021-120429/preds"),
+    "1% Volume": Path("/home/peisheng/MONAI/runs/grid_clip_zscore/scratch_subset_1/eval_20251021-133307/preds"),
+    "1% Slice": Path("/home/peisheng/MONAI/runs/few_slices_allcls_gpu0_20251021-110741/eval_20251021-122416/preds"),
+    "1% Voxel": Path("/home/peisheng/MONAI/runs/fp_1pct_global_d0_20251021-153502_eval/preds"),
+}
+
 
 def parse_cli_args():
-    ap = argparse.ArgumentParser(add_help=False)
-    ap.add_argument(
-        "--pred_dir",
-        type=str,
-        default="/home/peisheng/MONAI/runs/grid_clip_zscore/pretrained_subset_100_eval/preds",
-        help="Directory containing fully supervised *_pred files",
-    )
-    ap.add_argument(
-        "--pred_dir2",
-        type=str,
-        default="/home/peisheng/MONAI/runs/fixed_points_scratch50/ratio_0.00001_infer_20251009-154947/preds",
-        help="Optional second predictions dir to compare (e.g., few-shot)",
-    )
-    ap.add_argument("--datalist", type=str, default="datalist_test.json", help="JSON datalist with image/label/id")
-    ap.add_argument("--metrics", type=str, default="", help="Optional metrics JSON (summary)")
-    ap.add_argument(
-        "--pseudo_dir",
-        type=str,
-        default="/data3/wp5/wp5-code/dataloaders/wp5-dataset/pseudo_labels_1pct_train",
-        help="Directory of 1% pseudo labels (mirrors label filenames)",
-    )
-    ap.add_argument(
-        "--pseudo_intermediate_dir",
-        type=str,
-        default="/data3/wp5/wp5-code/dataloaders/wp5-dataset/pseudo_labels_1pct_train_intermediate",
-        help="Directory of intermediates for 1% pseudo labels (selected points, JSON)",
-    )
-    known, _ = ap.parse_known_args()
-    return known
+    # Legacy parser kept for backward-compat; not used.
+    class _Args:
+        pass
+    return _Args()
 
 
 def load_json(path: Path):
@@ -719,35 +700,29 @@ def plot_3d_pair_matplotlib(
 
 
 def main():
-    args = parse_cli_args()
-
-    st.title("WP5 Segmentation Viewer")
+    st.title("WP5 Segmentation Viewer — Fixed Runs")
     with st.sidebar:
-        pred_dir = st.text_input("Predictions dir", value=args.pred_dir)
-        pred_dir2 = st.text_input(
-            "Few-shot predictions dir",
-            value=args.pred_dir2,
-            help="Folder containing few-shot preds (e.g., .../ratio_..._infer.../preds)",
-        )
-        datalist_path = st.text_input("Datalist JSON", value=args.datalist)
-        metrics_path = st.text_input("Metrics JSON (optional)", value=args.metrics)
+        st.caption("Browsing fixed evaluation runs")
+        st.write("Datalist:")
+        st.code(str(DATALIST_PATH))
+        for name, p in RUNS.items():
+            st.write(f"{name} preds:")
+            st.code(str(p))
         alpha = st.slider("Overlay alpha", 0.1, 1.0, 0.4, 0.05)
         st.markdown("---")
-        st.caption("1% Pseudo-Label Verification")
-        pseudo_dir = st.text_input("Pseudo-labels dir (1%)", value=args.pseudo_dir)
-        pseudo_mid_dir = st.text_input("Pseudo intermediates dir", value=args.pseudo_intermediate_dir)
+        # Disable Plotly option for now; keep Matplotlib fixed with a hover hint.
+        st.radio("3D Renderer", options=["Matplotlib (static)"], index=0, horizontal=False, disabled=True, help="Plotly (interactive) will be implemented in the future.")
+        renderer = "Matplotlib (static)"
+        # Disable show-image toggle (Plotly-only feature) with a hover hint.
+        show_img_vol = st.checkbox("3D: show underlying image volume (Plotly)", value=False, disabled=True, help="This Plotly overlay will be implemented in the future.")
+        ds = st.slider("3D downsample (higher=faster)", 1, 6, 3)
+        op = st.slider("3D surface opacity", 0.05, 0.95, 0.5, 0.05)
 
-    pred_dir_p = Path(pred_dir) if pred_dir else None
-    pred_dir2_p = Path(pred_dir2) if pred_dir2 else None
-    datalist_p = Path(datalist_path) if datalist_path else None
-
-    if datalist_p is None or not datalist_p.exists():
-        st.info("Provide a valid datalist JSON path.")
+    if not DATALIST_PATH.exists():
+        st.error(f"Datalist not found: {DATALIST_PATH}")
         st.stop()
-    if pred_dir_p is None or not pred_dir_p.exists():
-        st.info("Predictions directory not set or not found. Predictions tab will be limited.")
 
-    records = load_json(datalist_p)
+    records = load_json(DATALIST_PATH)
     if not records:
         st.warning("Datalist is empty or could not be loaded.")
         st.stop()
@@ -757,15 +732,13 @@ def main():
     rec = next(r for r in records if r.get("id") == case_sel)
     img_path = Path(rec["image"]) if rec.get("image") else None
     lbl_path = Path(rec["label"]) if rec.get("label") else None
-    pred_path = find_pred_path(pred_dir_p, img_path, case_sel) if (pred_dir_p and img_path) else None
-    pred2_path = find_pred_path(pred_dir2_p, img_path, case_sel) if (pred_dir2_p and img_path and pred_dir2_p.exists()) else None
 
     col_a, col_b = st.columns([1, 1])
     with col_a:
-        st.write(f"Image: {img_path}")
         if img_path and img_path.exists():
             img_vol, _ = load_nii(img_path)
-            st.write(f"Image shape: {img_vol.shape}")
+            st.write(f"Image: {img_path}")
+            st.write(f"Shape: {img_vol.shape}")
         else:
             st.error("Image not found; check datalist paths.")
             st.stop()
@@ -774,256 +747,92 @@ def main():
         lbl_vol = None
         if lbl_path and lbl_path.exists():
             lbl_vol, _ = load_nii(lbl_path)
-        st.write(f"Prediction (fully supervised): {pred_path}")
-        st.write(f"Prediction (few-shot 0.001%): {pred2_path}")
-        pred_vol = None
-        pred2_vol = None
-        if pred_path and pred_path.exists():
-            pred_vol, _ = load_volume_any(pred_path)
-            # ensure segmentation shape is (X,Y,Z)
-            if pred_vol.ndim == 4 and pred_vol.shape[0] == 1:
-                pred_vol = pred_vol[0]
-        if pred2_path and pred2_path.exists():
-            pred2_vol, _ = load_volume_any(pred2_path)
-            if pred2_vol.ndim == 4 and pred2_vol.shape[0] == 1:
-                pred2_vol = pred2_vol[0]
+
+        # Resolve predictions for the four fixed runs
+        pred_paths: Dict[str, Optional[Path]] = {}
+        for run_name, run_dir in RUNS.items():
+            pred_paths[run_name] = find_pred_path(run_dir, img_path, case_sel) if (img_path and run_dir.exists()) else None
+            st.write(f"{run_name}: {pred_paths[run_name]}")
+
+        # Load predictions volumes for each run
+        pred_vols: Dict[str, Optional[np.ndarray]] = {k: None for k in RUNS.keys()}
+        for run_name, pth in pred_paths.items():
+            if pth and pth.exists():
+                pv, _ = load_volume_any(pth)
+                if pv.ndim == 4 and pv.shape[0] == 1:
+                    pv = pv[0]
+                pred_vols[run_name] = pv
+
         # Align shapes if needed (center pad/crop)
         if lbl_vol is not None and lbl_vol.shape != img_vol.shape:
             lbl_vol = center_pad_or_crop(lbl_vol, img_vol.shape)
-        if pred_vol is not None and pred_vol.shape != img_vol.shape:
-            pred_vol = center_pad_or_crop(pred_vol, img_vol.shape)
-        if pred2_vol is not None and pred2_vol.shape != img_vol.shape:
-            pred2_vol = center_pad_or_crop(pred2_vol, img_vol.shape)
-        if pred_vol is None:
-            st.warning("Prediction not found for this case in pred_dir.")
+        for k, v in list(pred_vols.items()):
+            if v is not None and v.shape != img_vol.shape:
+                pred_vols[k] = center_pad_or_crop(v, img_vol.shape)
 
-        # Load 1% pseudo label if provided
-        pseudo_vol = None
-        pseudo_dir_p = Path(pseudo_dir) if pseudo_dir else None
-        pseudo_mid_p = Path(pseudo_mid_dir) if pseudo_mid_dir else None
-        pseudo_path = None
-        if pseudo_dir_p and pseudo_dir_p.exists() and lbl_path:
-            pseudo_path = find_pseudo_label_path(pseudo_dir_p, lbl_path)
-            st.write(f"Pseudo label (1%): {pseudo_path}")
-            if pseudo_path.exists():
-                pseudo_vol, _ = load_nii(pseudo_path)
-                if pseudo_vol.ndim == 4 and pseudo_vol.shape[0] == 1:
-                    pseudo_vol = pseudo_vol[0]
-                if pseudo_vol.shape != img_vol.shape:
-                    pseudo_vol = center_pad_or_crop(pseudo_vol, img_vol.shape)
-            else:
-                st.info("Pseudo label not found for this case.")
-        else:
-            st.caption("Set 'Pseudo-labels dir' in the sidebar to enable 1% verification.")
+    # 2D Slice View
+    st.subheader("2D Slice View")
+    axis = st.radio("Axis", options=["z", "y", "x"], index=0, horizontal=True, key="axis")
+    dim = {"x": 0, "y": 1, "z": 2}[axis]
+    size = int(img_vol.shape[dim])
+    idx = st.slider("Slice index", 0, max(0, size - 1), size // 2, key="idx")
 
-    # Tabs for viewers: Predictions vs 1% Verify
-    tab_pred, tab_1pct = st.tabs(["Predictions", "1% Verify"])
+    # Arrange panels: GT | Fully | 1% Volume  /  1% Slice | 1% Voxel
+    col_names_row1 = ["Ground Truth", "Fully Supervised", "1% Volume"]
+    col_names_row2 = ["1% Slice", "1% Voxel"]
 
-    with tab_pred:
-        st.subheader("2D Slice View")
-        axis = st.radio("Axis", options=["z", "y", "x"], index=0, horizontal=True, key="pred_axis")
-        dim = {"x": 0, "y": 1, "z": 2}[axis]
-        size = int(img_vol.shape[dim])
-        idx = st.slider("Slice index", 0, max(0, size - 1), size // 2, key="pred_idx")
-        if pred2_path and pred2_path.exists() and pred2_vol is not None:
-            draw_slice_triplet(
-                img_vol,
-                lbl_vol,
-                None,
-                pred_vol,
-                pred2_vol,
-                axis,
-                idx,
-                alpha,
-                title_left="GT",
-                title_middle="Prediction (fully supervised)",
-                title_right="Prediction (few-shot 0.001%)",
-            )
-        else:
-            draw_slice_pair(img_vol, lbl_vol, pred_vol, axis, idx, alpha)
-            with st.expander("Show combined overlay (image + GT + Pred)"):
-                draw_slice(img_vol, lbl_vol, pred_vol, axis, idx, alpha)
+    row1 = st.columns(3)
+    with row1[0]:
+        st.caption(col_names_row1[0])
+        draw_slice(img_vol, lbl_vol, None, axis, idx, alpha)
+    with row1[1]:
+        st.caption(col_names_row1[1])
+        pv = pred_vols.get("Fully Supervised")
+        draw_slice(img_vol, lbl_vol, pv, axis, idx, alpha)
+    with row1[2]:
+        st.caption(col_names_row1[2])
+        pv = pred_vols.get("1% Volume")
+        draw_slice(img_vol, lbl_vol, pv, axis, idx, alpha)
 
-        st.subheader("3D View")
-        cls = st.selectbox("Class isosurface (1-4)", options=[1, 2, 3, 4], index=1, key="pred_cls")
-        ds = st.slider("Downsample (higher=faster)", 1, 6, 3, key="pred_ds")
-        op = st.slider("Surface opacity", 0.05, 0.95, 0.5, 0.05, key="pred_op")
-        renderer = st.radio("Renderer", options=["Matplotlib (static)", "Plotly (interactive)"] , index=0, horizontal=True, key="pred_renderer")
-        if renderer.startswith("Plotly"):
-            if go is None:
-                st.info("Install plotly for 3D view: pip install plotly")
-            else:
-                show_img_vol = st.checkbox("Show underlying image volume", value=False, key="pred_show_img")
-                # GT vs Prediction (fully supervised)
-                plot_3d_pair(
-                    img_vol, lbl_vol, pred_vol, cls=cls, downsample=ds, opacity=op, show_image=show_img_vol, right_title="Prediction (fully supervised)"
-                )
-                # If available, also show GT vs Prediction (few-shot 0.001%)
-                if pred2_path and pred2_path.exists() and pred2_vol is not None:
-                    st.markdown("---")
-                    plot_3d_pair(
-                        img_vol, lbl_vol, pred2_vol, cls=cls, downsample=ds, opacity=op, show_image=show_img_vol, right_title="Prediction (few-shot 0.001%)"
-                    )
-        else:
-            plot_3d_pair_matplotlib(lbl_vol, pred_vol, cls=cls, downsample=ds, opacity=op, right_title="Prediction (fully supervised)")
-            if pred2_path and pred2_path.exists() and pred2_vol is not None:
-                st.markdown("---")
-                plot_3d_pair_matplotlib(lbl_vol, pred2_vol, cls=cls, downsample=ds, opacity=op, right_title="Prediction (few-shot 0.001%)")
+    row2 = st.columns(2)
+    with row2[0]:
+        st.caption(col_names_row2[0])
+        pv = pred_vols.get("1% Slice")
+        draw_slice(img_vol, lbl_vol, pv, axis, idx, alpha)
+    with row2[1]:
+        st.caption(col_names_row2[1])
+        pv = pred_vols.get("1% Voxel")
+        draw_slice(img_vol, lbl_vol, pv, axis, idx, alpha)
 
-        # Per-class Dice comparison
-        if lbl_vol is not None and (pred_vol is not None or pred2_vol is not None):
-            st.subheader("Per-Class Dice vs GT (0..4)")
-            cols = st.columns(2 if (pred_vol is not None and pred2_vol is not None) else 1)
-            if pred_vol is not None:
-                with cols[0]:
-                    d_full = dice_per_class(pred_vol.astype(np.int64), lbl_vol.astype(np.int64))
-                    st.write("Prediction (fully supervised)")
-                    st.json({str(k): float(v) for k, v in d_full.items()})
-            if pred2_vol is not None:
-                with (cols[1] if pred_vol is not None else cols[0]):
-                    d_few = dice_per_class(pred2_vol.astype(np.int64), lbl_vol.astype(np.int64))
-                    st.write("Prediction (few-shot 0.001%)")
-                    st.json({str(k): float(v) for k, v in d_few.items()})
-
-        # Metrics (optional)
-        if not metrics_path and pred_dir_p is not None:
-            cand = pred_dir_p.parent / "metrics" / "summary.json"
-            if cand.exists():
-                metrics_path = str(cand)
-        if metrics_path:
-            mp = Path(metrics_path)
-            if mp.exists():
-                js = load_json(mp)
-                if isinstance(js, dict) and "average" in js:
-                    st.subheader("Summary Metrics (0..4)")
-                    avg = js.get("average", {})
-                    st.write({"dice": avg.get("dice"), "iou": avg.get("iou"), "hd": avg.get("hd"), "asd": avg.get("asd")})
-                    st.caption(str(mp))
-
-    with tab_1pct:
-        st.subheader("1% Pseudo-Label Quick Check")
-        if pseudo_vol is None:
-            st.info("Provide a valid pseudo-labels directory to enable this tab.")
-        else:
-            axis2 = st.radio("Axis", options=["z", "y", "x"], index=0, horizontal=True, key="ps_axis")
-            dim2 = {"x": 0, "y": 1, "z": 2}[axis2]
-            size2 = int(img_vol.shape[dim2])
-            idx2 = st.slider("Slice index", 0, max(0, size2 - 1), size2 // 2, key="ps_idx")
-            # Optional overlay of selected points
-            points_mask = None
-            if pseudo_mid_p is not None:
-                cand_points = pseudo_mid_p / str(case_sel) / "mask_selected_points.nii"
-                if cand_points.exists():
-                    try:
-                        points_mask, _ = load_nii(cand_points)
-                        if points_mask.ndim == 4 and points_mask.shape[0] == 1:
-                            points_mask = points_mask[0]
-                        if points_mask.shape != img_vol.shape:
-                            points_mask = center_pad_or_crop(points_mask, img_vol.shape)
-                    except Exception as e:
-                        st.warning(f"Failed to load selected points mask: {e}")
-            show_points = st.checkbox("Overlay selected points", value=True, key="ps_show_points")
-            ov_left = points_mask if show_points else None
-            ov_right = points_mask if show_points else None
-
-            # Show GT vs Pseudo
-            draw_slice_pair(
-                img_vol,
-                lbl_vol,
-                pseudo_vol,
-                axis2,
-                idx2,
-                alpha,
-                title_left="Ground Truth",
-                title_right="Pseudo Label (1%)",
-                overlay_left=ov_left,
-                overlay_right=ov_right,
-            )
-            with st.expander("Show combined overlay (image + GT + Pseudo)"):
-                draw_slice(img_vol, lbl_vol, pseudo_vol, axis2, idx2, alpha)
-
-            # Basic stats
-            st.subheader("Per-Class Stats (counts and Dice over 0..4)")
-            c_gt = counts_per_class(lbl_vol)
-            c_ps = counts_per_class(pseudo_vol)
-            dice = dice_per_class(pseudo_vol.astype(np.int64), lbl_vol.astype(np.int64))
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.write("GT voxel counts")
-                st.json({str(k): int(v) for k, v in c_gt.items()})
-            with col2:
-                st.write("Pseudo voxel counts")
-                st.json({str(k): int(v) for k, v in c_ps.items()})
-            with col3:
-                st.write("Dice (0..4)")
-                st.json({str(k): float(v) for k, v in dice.items()})
-            with col4:
-                # Selected points counts per class (from sidecar preferred)
-                sel_counts = None
-                case_dir = pseudo_mid_p / str(case_sel) if pseudo_mid_p is not None else None
-                sidecar = case_dir / f"{case_sel}.json" if case_dir is not None else None
-                if sidecar is not None and sidecar.exists():
-                    try:
-                        sj = load_json(sidecar)
-                        sel_counts = sj.get("selected_points_counts")
-                    except Exception:
-                        sel_counts = None
-                if sel_counts is None and points_mask is not None:
-                    sel_counts = counts_per_class(points_mask, classes=(0, 1, 2, 3, 4))
-                st.write("Selected points counts")
-                show_bg = st.checkbox("Include class 0", value=True, key="sel_counts_bg")
-                if sel_counts is not None:
-                    # Normalize format to {class: total}
-                    norm = {}
-                    for k, v in sel_counts.items():
-                        kk = int(k)
-                        if not show_bg and kk == 0:
-                            continue
-                        if isinstance(v, dict) and 'total' in v:
-                            norm[str(kk)] = int(v['total'])
-                        else:
-                            norm[str(kk)] = int(v)
-                    st.json(norm)
+    # Per-class Dice comparison (selected case)
+    if lbl_vol is not None:
+        st.subheader("Per-Class Dice vs GT (0..4)")
+        cols = st.columns(4)
+        names = ["Fully Supervised", "1% Volume", "1% Slice", "1% Voxel"]
+        for i, name in enumerate(names):
+            with cols[i]:
+                pv = pred_vols.get(name)
+                st.write(name)
+                if pv is not None:
+                    d = dice_per_class(pv.astype(np.int64), lbl_vol.astype(np.int64))
+                    st.json({str(k): float(v) for k, v in d.items()})
                 else:
-                    st.info("No selected points info available.")
+                    st.info("No prediction for this case.")
 
-            # 3D compare
-            st.subheader("3D Compare (GT vs Pseudo)")
-            cls2 = st.selectbox("Class isosurface (1-4)", options=[1, 2, 3, 4], index=1, key="ps_cls")
-            ds2 = st.slider("Downsample (higher=faster)", 1, 6, 3, key="ps_ds")
-            op2 = st.slider("Surface opacity", 0.05, 0.95, 0.5, 0.05, key="ps_op")
-            renderer2 = st.radio("Renderer", options=["Matplotlib (static)", "Plotly (interactive)"] , index=0, horizontal=True, key="ps_renderer")
-            if renderer2.startswith("Plotly"):
-                if go is None:
-                    st.info("Install plotly for 3D view: pip install plotly")
-                else:
-                    show_img_vol2 = st.checkbox("Show underlying image volume", value=False, key="ps_show_img")
-                    plot_3d_pair(
-                        img_vol,
-                        lbl_vol,
-                        pseudo_vol,
-                        cls=cls2,
-                        downsample=ds2,
-                        opacity=op2,
-                        show_image=show_img_vol2,
-                        right_title="Pseudo",
-                    )
+    # 3D View (GT vs Prediction)
+    st.subheader("3D View (GT vs Prediction)")
+    cls = st.selectbox("Class isosurface (1-4)", options=[1, 2, 3, 4], index=1, key="cls")
+    tabs = st.tabs(["Fully Supervised", "1% Volume", "1% Slice", "1% Voxel"])
+    for tab, name in zip(tabs, ["Fully Supervised", "1% Volume", "1% Slice", "1% Voxel"]):
+        with tab:
+            pv = pred_vols.get(name)
+            if pv is None:
+                st.info("No prediction available for this case.")
             else:
-                plot_3d_pair_matplotlib(lbl_vol, pseudo_vol, cls=cls2, downsample=ds2, opacity=op2, right_title="Pseudo")
-
-            # Intermediates summary
-            if pseudo_mid_p and pseudo_mid_p.exists():
-                case_dir = pseudo_mid_p / str(case_sel)
-                sidecar = case_dir / f"{case_sel}.json"
-                st.subheader("Intermediates Summary")
-                if sidecar.exists():
-                    try:
-                        sj = load_json(sidecar)
-                        st.json(sj)
-                    except Exception as e:
-                        st.warning(f"Failed to load sidecar JSON: {e}")
+                if renderer.startswith("Plotly"):
+                    plot_3d_pair(img_vol, lbl_vol, pv, cls=cls, downsample=ds, opacity=op, show_image=show_img_vol, right_title=name)
                 else:
-                    st.info("No sidecar JSON found for this case.")
+                    plot_3d_pair_matplotlib(lbl_vol, pv, cls=cls, downsample=ds, opacity=op, right_title=name)
 
 
 if __name__ == "__main__":
