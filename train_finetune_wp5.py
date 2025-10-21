@@ -22,10 +22,15 @@ Optionally, train from a pretrained checkpoint (non-strict load for head):
 Train from scratch explicitly:
   python train_finetune_wp5.py --mode train --init scratch --output_dir runs/wp5_finetune_scratch
 
-Evaluate a saved checkpoint on test set and save predictions:
-  python train_finetune_wp5.py --mode infer \
+Evaluate a saved checkpoint on the test set (preferred):
+  # Use the dedicated evaluator (timestamps + HD95/HD + policy metadata)
+  python scripts/eval_wp5.py \
     --ckpt runs/wp5_finetune_full/best.ckpt \
-    --save_preds --output_dir runs/wp5_finetune_full_infer
+    --datalist datalist_test.json \
+    --output_dir runs/wp5_finetune_full/eval \
+    --save_preds --heavy --hd_percentile 95 --empty_pair_policy count_as_one
+
+Deprecated (avoid): `--mode infer` in this script. Prefer scripts/eval_wp5.py for evaluation.
 
 Notes:
 - Label policy: evaluate classes 0..4 (background included), ignore class 6 in loss/metrics.
@@ -740,9 +745,9 @@ def get_transforms(
             EnsureChannelFirstd(keys=["image", "label"]),
             Orientationd(keys=["image", "label"], axcodes="RAS"),
         ]
-        # If using static few_points with precomputed masks, load them before spatial transforms
-        static_points = training and fewshot_static and fewshot_mode == "few_points" and save_sup_masks_dir is not None
-        if static_points:
+        # If using static supervision masks (few_points or few_slices), load them before spatial transforms
+        static_sup = training and fewshot_static and (save_sup_masks_dir is not None)
+        if static_sup:
             seq.append(LoadSavedMasksD(keys=["label"], id_key="id", dir_path=save_sup_masks_dir))
         if norm_transform is not None:
             seq.append(norm_transform)
@@ -750,7 +755,7 @@ def get_transforms(
         # For validation, avoid padding labels so evaluation is computed on true FOV only;
         # sliding_window_inference pads internally as needed and returns the original spatial size.
         if training:
-            pad_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
+            pad_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
             # Allow optional keys to be absent (e.g., pseudo_label may not exist for sparse points)
             seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi, allow_missing_keys=True))
         # Optional intensity augmentations (training only)
@@ -763,7 +768,7 @@ def get_transforms(
                 ]
             )
         if include_aug:
-            flip_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
+            flip_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
             seq.extend([
                 RandFlipd(keys=flip_keys, spatial_axis=0, prob=0.5, allow_missing_keys=True),
                 RandFlipd(keys=flip_keys, spatial_axis=1, prob=0.5, allow_missing_keys=True),
@@ -771,11 +776,11 @@ def get_transforms(
             ])
         if include_crop:
             if fg_crop_prob > 0.0 and training:
-                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
+                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
                 # Custom crop transform already tolerates missing keys
                 seq.append(FGBiasedCropD(keys=crop_keys, roi_size=roi, prob=fg_crop_prob, margin=fg_crop_margin))
             else:
-                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_points else ["image", "label"]
+                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
                 seq.append(RandSpatialCropd(keys=crop_keys, roi_size=roi, random_size=False, allow_missing_keys=True))
         return seq
 
@@ -955,7 +960,8 @@ def compute_metrics(
     pred: torch.Tensor,
     gt: torch.Tensor,
     heavy: bool = True,
-    empty_pair_policy: str = "exclude",
+    empty_pair_policy: str = "count_as_one",
+    hd_percentile: float = 100.0,
 ) -> Dict[int, Dict[str, float]]:
     """Compute per-class Dice, IoU, and optionally HD/ASD for classes 0..4; ignore class 6.
 
@@ -970,7 +976,7 @@ def compute_metrics(
     ignore_mask = (gt != 6)
     classes = [0, 1, 2, 3, 4]
     if heavy:
-        hd_metric = HausdorffDistanceMetric(percentile=100.0, reduction="none")
+        hd_metric = HausdorffDistanceMetric(percentile=float(hd_percentile), reduction="none")
         asd_metric = SurfaceDistanceMetric(symmetric=True, reduction="none")
 
     out: Dict[int, Dict[str, float]] = {}
@@ -1412,6 +1418,46 @@ def precompute_sup_masks_from_selected_points(
                 print(f"INFO: pseudo label not found for {cid} at {pl_path}; skipping pseudolabel save")
 
 
+def precompute_sup_masks_from_selected_slices(
+    train_list: List[Dict],
+    slice_sel_json: Path,
+    out_dir: Path,
+) -> None:
+    """Precompute static sup masks from a selected_slices.json for few_slices mode.
+
+    Each entry in JSON must have: {"id": str, "axis": "x"|"y"|"z", "index": int}.
+    Saves <out_dir>/<id>_supmask.npy with shape (1,X,Y,Z) bool in RAS orientation.
+    """
+    entries = json.loads(slice_sel_json.read_text())
+    by_id: Dict[str, Dict[str, set]] = {}
+    for e in entries:
+        cid = e["id"]
+        ax = str(e["axis"]).lower()
+        idx = int(e["index"])
+        by_id.setdefault(cid, {}).setdefault(ax, set()).add(idx)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for rec in train_list:
+        cid = rec["id"]
+        # Load label to get oriented shape
+        arr = _load_label_volume(rec["label"])  # (1,X,Y,Z)
+        _, X, Y, Z = arr.shape
+        sup = np.zeros_like(arr, dtype=bool)
+        axes_sel = by_id.get(cid, {})
+        xs = axes_sel.get('x', set())
+        ys = axes_sel.get('y', set())
+        zs = axes_sel.get('z', set())
+        for i in xs:
+            if 0 <= i < X:
+                sup[0, i, :, :] = True
+        for i in ys:
+            if 0 <= i < Y:
+                sup[0, :, i, :] = True
+        for i in zs:
+            if 0 <= i < Z:
+                sup[0, :, :, i] = True
+        np.save(out_dir / f"{cid.replace('/', '_')}_supmask.npy", sup)
+
+
 def evaluate(
     net: torch.nn.Module,
     dl: DataLoader,
@@ -1420,7 +1466,8 @@ def evaluate(
     save_preds: bool = False,
     max_cases: int | None = None,
     heavy: bool = True,
-    empty_pair_policy: str = "exclude",
+    empty_pair_policy: str = "count_as_one",
+    hd_percentile: float = 100.0,
 ) -> Dict[str, Dict]:
     net.eval()
     metrics_dir = out_dir / "metrics"
@@ -1479,7 +1526,13 @@ def evaluate(
                             base = f"case_{i}_{b}"
                         np.save(pred_dir / f"{base}_pred.npy", pred[b].cpu().numpy())
 
-            per_class = compute_metrics(pred.cpu(), gt.cpu(), heavy=heavy, empty_pair_policy=empty_pair_policy)
+            per_class = compute_metrics(
+                pred.cpu(),
+                gt.cpu(),
+                heavy=heavy,
+                empty_pair_policy=empty_pair_policy,
+                hd_percentile=hd_percentile,
+            )
             for c in classes:
                 sums[c]["dice"] += per_class[c]["dice"]
                 sums[c]["iou"] += per_class[c]["iou"]
@@ -1510,9 +1563,17 @@ def evaluate(
         "hd": float(np.mean([summary[str(c)]["hd"] for c in classes if summary[str(c)]["hd"] is not None])) if heavy else None,
         "asd": float(np.mean([summary[str(c)]["asd"] for c in classes if summary[str(c)]["asd"] is not None])) if heavy else None,
     }
+    meta = {
+        "empty_pair_policy": empty_pair_policy,
+        "heavy": bool(heavy),
+        "hd_percentile": float(hd_percentile),
+        "classes": [0, 1, 2, 3, 4],
+        "ignore_label": 6,
+    }
+    payload = {"per_class": summary, "average": avg, "meta": meta}
     # save epoch metrics to JSON
-    (metrics_dir / "summary.json").write_text(json.dumps({"per_class": summary, "average": avg}, indent=2))
-    return {"per_class": summary, "average": avg}
+    (metrics_dir / "summary.json").write_text(json.dumps(payload, indent=2))
+    return payload
 
 
 def train(args):
@@ -1530,10 +1591,14 @@ def train(args):
 
     # Transforms and datasets
     # Where to save/load static supervision masks
-    save_masks_dir = str(out_dir / "sup_masks") if (getattr(args, "save_sup_masks", False) or args.fewshot_static) else None
+    if getattr(args, "sup_masks_dir", ""):
+        save_masks_dir = args.sup_masks_dir
+        print(f"Using precomputed supervision masks from: {save_masks_dir}")
+    else:
+        save_masks_dir = str(out_dir / "sup_masks") if (getattr(args, "save_sup_masks", False) or args.fewshot_static) else None
 
-    # Precompute static masks for few_points mode
-    if args.fewshot_mode == "few_points" and args.fewshot_static:
+    # Precompute static masks for few_points or few_slices mode as requested
+    if args.fewshot_mode == "few_points" and args.fewshot_static and not getattr(args, "sup_masks_dir", ""):
         Path(save_masks_dir).mkdir(parents=True, exist_ok=True)
         if getattr(args, "selected_points_dir", ""):
             print("Precomputing static few-shot masks from selected points (raw or dilated seeds)...")
@@ -1546,20 +1611,40 @@ def train(args):
                 dilate_radius=args.fp_dilate_radius,
             )
         elif getattr(args, "global_budget", True):
-            print("Precomputing static few-shot masks with global seed budget across train set...")
-            precompute_static_global_seed_masks(
-                train_list=train_list,
-                masks_dir=Path(save_masks_dir),
-                ratio=args.fewshot_ratio,
-                seed_bg_frac=args.seed_bg_frac,
-                dilate_radius=args.fp_dilate_radius,
-                balance=args.fp_balance,
-                no_overlap=args.fp_no_overlap,
-                dilation_shape=args.dilation_shape,
-                seed=args.seed,
-                sample_mode=getattr(args, "fp_sample_mode", "stratified"),
-                uniform_exclude6=getattr(args, "fp_uniform_exclude6", False),
-            )
+            # Avoid accidental overwrite and invalid ratios
+            target_dir = Path(save_masks_dir)
+            existing = target_dir.exists() and any(target_dir.glob("*_seedmask.npy"))
+            if args.fewshot_ratio <= 0.0:
+                print("WARNING: --fewshot_ratio is 0.0; skipping precompute of static masks.")
+            elif existing and not getattr(args, "force_recompute_sup", False):
+                print(f"Found existing supervision masks under {target_dir}; skipping recompute (use --force_recompute_sup to overwrite).")
+            else:
+                print(
+                    "Precomputing static few-shot masks with global seed budget across train set... "
+                    f"ratio={args.fewshot_ratio}, seed_bg_frac={args.seed_bg_frac}, radius={args.fp_dilate_radius}, balance={args.fp_balance}"
+                )
+                precompute_static_global_seed_masks(
+                    train_list=train_list,
+                    masks_dir=target_dir,
+                    ratio=args.fewshot_ratio,
+                    seed_bg_frac=args.seed_bg_frac,
+                    dilate_radius=args.fp_dilate_radius,
+                    balance=args.fp_balance,
+                    no_overlap=args.fp_no_overlap,
+                    dilation_shape=args.dilation_shape,
+                    seed=args.seed,
+                    sample_mode=getattr(args, "fp_sample_mode", "stratified"),
+                    uniform_exclude6=getattr(args, "fp_uniform_exclude6", False),
+                )
+    elif args.fewshot_mode == "few_slices" and args.fewshot_static and getattr(args, "slice_sel_json", "") and not getattr(args, "sup_masks_dir", ""):
+        # If a selection JSON is provided and no external sup_masks_dir is set, precompute masks into <out_dir>/sup_masks
+        Path(save_masks_dir).mkdir(parents=True, exist_ok=True)
+        print("Precomputing static sup masks for few_slices from selection JSON...")
+        precompute_sup_masks_from_selected_slices(
+            train_list=train_list,
+            slice_sel_json=Path(args.slice_sel_json),
+            out_dir=Path(save_masks_dir),
+        )
 
     t_train, t_val = get_transforms(
         roi=(args.roi_x, args.roi_y, args.roi_z),
@@ -1643,6 +1728,9 @@ def train(args):
         cov_sum_sup = 0.0
         pl_cov_sum = 0.0
         t0 = time.time()
+        # global counter of debug grad checks across training
+        if not hasattr(train, "_grad_checks_done"):
+            train._grad_checks_done = 0  # type: ignore[attr-defined]
         for batch in dl_train:
             img = batch["image"].to(device)
             lbl = batch["label"].long().to(device)  # (B,1,...)
@@ -1658,13 +1746,19 @@ def train(args):
                 if pseudo_label is not None:
                     pseudo_label = pseudo_label.to(device).squeeze(1)
             elif args.fewshot_mode == "few_slices":
-                k_override = args.fs_k_slices if args.fs_k_slices > 0 else None
-                sup_mask = build_slice_supervision_mask(
-                    labels=lbl, roi=(args.roi_x, args.roi_y, args.roi_z), axis_mode=args.fs_axis_mode,
-                    ratio=args.fewshot_ratio, k_override=k_override,
-                )
-                seed_mask = sup_mask
-                pseudo_label = None
+                # If static sup masks are provided via transforms, prefer them
+                if args.fewshot_static and ("sup_mask" in batch):
+                    sup_mask = batch["sup_mask"].to(device).bool()
+                    seed_mask = sup_mask
+                    pseudo_label = None
+                else:
+                    k_override = args.fs_k_slices if args.fs_k_slices > 0 else None
+                    sup_mask = build_slice_supervision_mask(
+                        labels=lbl, roi=(args.roi_x, args.roi_y, args.roi_z), axis_mode=args.fs_axis_mode,
+                        ratio=args.fewshot_ratio, k_override=k_override,
+                    )
+                    seed_mask = sup_mask
+                    pseudo_label = None
             else:
                 sup_mask = torch.ones_like(lbl, dtype=torch.bool, device=device)
                 seed_mask = sup_mask
@@ -1703,6 +1797,9 @@ def train(args):
                 cov_sum += cov
 
             logits = net(img)
+            # retain gradient on logits if we plan to inspect it
+            if getattr(args, "debug_grad_check", False):
+                logits.retain_grad()
             # Seed-only GT supervision
             ce_target_seed = lbl.squeeze(1).clone()
             seed_mask_s = seed_mask.squeeze(1)
@@ -1750,6 +1847,76 @@ def train(args):
 
             optimizer.zero_grad()
             loss.backward()
+
+            # Optional gradient inspection: verify zero grads outside active supervision
+            if getattr(args, "debug_grad_check", False):
+                # Limit how many batches to print across the whole training run
+                if train._grad_checks_done < max(1, int(getattr(args, "debug_grad_batches", 1))):  # type: ignore[attr-defined]
+                    g = logits.grad.detach()
+                    B, C = g.shape[:2]
+                    # Active supervision mask over voxels (B,1,X,Y,Z), excluding label==6
+                    active = torch.zeros_like(lbl, dtype=torch.bool)
+                    # seed CE and Dice supervise seed_mask where label!=6
+                    active |= (seed_mask & ignore_mask)
+                    # dilated-only region for pseudo supervision
+                    try:
+                        dil_only = (sup_mask.squeeze(1) & (~seed_mask.squeeze(1)))
+                    except Exception:
+                        dil_only = torch.zeros_like(seed_mask.squeeze(1), dtype=torch.bool)
+                    if pseudo_label is not None:
+                        active |= dil_only.unsqueeze(1)
+                    # model-based PL mask if enabled
+                    pmask = None
+                    if args.pl_enable and epoch > args.pl_warmup_epochs:
+                        with torch.no_grad():
+                            probs_dbg = torch.softmax(logits, dim=1)
+                            pmax_dbg, _ = probs_dbg.max(dim=1)
+                            pmask = ((~sup_mask.squeeze(1)) & ignore_mask.squeeze(1) & (pmax_dbg >= args.pl_threshold))
+                    if pmask is not None:
+                        active |= pmask.unsqueeze(1)
+                    # Exclude class 6 voxels from consideration entirely
+                    valid = ignore_mask
+                    # Expand masks to channel dimension to compare with g
+                    active_c = active.expand(-1, C, -1, -1, -1)
+                    valid_c = valid.expand(-1, C, -1, -1, -1)
+                    unsup_c = valid_c & (~active_c)
+                    sup_c = active_c
+                    eps = float(getattr(args, "debug_grad_eps", 1e-10))
+                    unsup_abs = g[unsup_c].abs()
+                    sup_abs = g[sup_c].abs()
+                    nz_unsup = int((unsup_abs > eps).sum().item())
+                    max_unsup = float(unsup_abs.max().item()) if unsup_abs.numel() else 0.0
+                    mean_unsup = float(unsup_abs.mean().item()) if unsup_abs.numel() else 0.0
+                    mean_sup = float(sup_abs.mean().item()) if sup_abs.numel() else 0.0
+                    total_unsup = int(unsup_abs.numel())
+                    total_sup = int(sup_abs.numel())
+                    status = "OK" if nz_unsup == 0 else "WARN"
+                    print(
+                        f"[grad-check] epoch {epoch} batch {n_batches+1}: {status} || "
+                        f"unsup_nz={nz_unsup}/{total_unsup}, max_unsup={max_unsup:.3e}, "
+                        f"mean_unsup={mean_unsup:.3e}, mean_sup={mean_sup:.3e}"
+                    )
+                    # Optional: print top-K offending unsupervised locations
+                    topk = int(getattr(args, "debug_grad_topk", 0))
+                    if topk > 0 and nz_unsup > 0:
+                        k = min(topk, unsup_abs.numel())
+                        vals, idxs = torch.topk(unsup_abs, k=k, largest=True)
+                        # Reconstruct indices into (B,C,X,Y,Z) among unsupervised entries
+                        # For readability, we only print first few
+                        print("[grad-check] top unsup grads:")
+                        # Build flat mapping from unsup mask to indices
+                        flat_idx = idxs.cpu().numpy().tolist()
+                        vals_np = vals.cpu().numpy().tolist()
+                        # Traverse to find coordinates (costly if huge; keep k small)
+                        # We iterate over tensor positions to find matching linear order within unsup mask
+                        # For performance, we compute direct unravel on a compacted view
+                        # Create a view where unsup entries are compacted contiguously
+                        # This step keeps it simple without heavy coordinate reporting
+                        for i, v in enumerate(vals_np):
+                            if i >= k:
+                                break
+                            print(f"    {i+1}: |grad|={v:.3e}")
+                    train._grad_checks_done += 1  # type: ignore[attr-defined]
             optimizer.step()
 
             epoch_loss += loss.item()
@@ -1764,11 +1931,12 @@ def train(args):
         # Always print both seed and sup coverage means if using few_points
         extra_cov = ""
         if args.fewshot_mode == "few_points":
-            extra_cov = f" - cov_seeds_mean {cov_seeds_epoch:.4f} - cov_sup_mean {cov_sup_epoch:.4f}"
+            # Show higher precision (scientific if needed) to avoid 0.0000 confusion
+            extra_cov = f" - cov_seeds_mean {cov_seeds_epoch:.6g} - cov_sup_mean {cov_sup_epoch:.6g}"
         print(
             f"Epoch {epoch}/{args.epochs} - loss {avg_loss:.4f} - {dur:.1f}s - lr {optimizer.param_groups[0]['lr']:.2e}"
-            + f" - avg_cov({getattr(args, 'coverage_mode', 'sup')}) {cov_epoch:.4f}" + extra_cov
-            + (f" - pl_coverage {plcov_epoch:.4f}" if args.pl_enable else "")
+            + f" - avg_cov({getattr(args, 'coverage_mode', 'sup')}) {cov_epoch:.6g}" + extra_cov
+            + (f" - pl_coverage {plcov_epoch:.6g}" if args.pl_enable else "")
         )
 
         # Evaluate on test set (fast: skip HD/ASD to keep GPU utilization higher)
@@ -1780,7 +1948,8 @@ def train(args):
             save_preds=False,
             max_cases=None,
             heavy=False,
-            empty_pair_policy=getattr(args, "empty_pair_policy", "exclude"),
+            empty_pair_policy=getattr(args, "empty_pair_policy", "count_as_one"),
+            hd_percentile=getattr(args, "hd_percentile", 100.0),
         )
         avg_dice = metrics["average"]["dice"]
         # Save epoch metrics
@@ -1856,7 +2025,8 @@ def infer(args):
         save_preds=args.save_preds,
         max_cases=None,
         heavy=True,
-        empty_pair_policy=getattr(args, "empty_pair_policy", "exclude"),
+        empty_pair_policy=getattr(args, "empty_pair_policy", "count_as_one"),
+        hd_percentile=getattr(args, "hd_percentile", 100.0),
     )
     (out_dir / "metrics" / "summary.json").write_text(json.dumps(metrics, indent=2))
     print("Inference complete. Metrics saved.")
@@ -1900,9 +2070,18 @@ def parse_args():
     p.add_argument(
         "--empty_pair_policy",
         type=str,
-        default="exclude",
+        default="count_as_one",
         choices=["exclude", "count_as_one"],
-        help="When both pred and GT are empty for a class in a sample: 'exclude' (skip from averaging) or 'count_as_one' (score 1.0)",
+        help=(
+            "When a class is absent in both prediction and GT for a case: "
+            "'count_as_one' (default; standard reporting, score 1.0) or 'exclude' (skip from averaging; exploration only)"
+        ),
+    )
+    p.add_argument(
+        "--hd_percentile",
+        type=float,
+        default=100.0,
+        help="Hausdorff percentile: 100.0 for HD, 95.0 for HD95 (matches /data3/wp5/wp5-code).",
     )
     # Few-shot configuration
     p.add_argument(
@@ -1952,8 +2131,18 @@ def parse_args():
     p.add_argument("--pl_threshold", type=float, default=0.9, help="Confidence threshold for pseudo-labeling (pmax >= threshold)")
     p.add_argument("--pl_weight", type=float, default=0.2, help="Weight for pseudo-label CE term")
     p.add_argument("--pl_warmup_epochs", type=int, default=5, help="Number of epochs to skip pseudo-labeling for warm-up")
+    # Safety for mask precompute
+    p.add_argument("--force_recompute_sup", action="store_true", help="Force overwriting existing static supervision masks when precomputing")
+    # Debug / verification
+    p.add_argument("--debug_grad_check", action="store_true", help="Log gradient stats and verify zeros outside supervision regions")
+    p.add_argument("--debug_grad_batches", type=int, default=1, help="Number of batches to run grad-check logging across the whole training run")
+    p.add_argument("--debug_grad_eps", type=float, default=1e-10, help="Tolerance for considering a gradient as non-zero in grad-check")
+    p.add_argument("--debug_grad_topk", type=int, default=0, help="If >0, print top-K absolute gradient magnitudes outside supervision")
     # Sup mask persistence
     p.add_argument("--save_sup_masks", action="store_true", help="Save per-volume static supervision masks (few_points + --fewshot_static) to <output_dir>/sup_masks")
+    p.add_argument("--sup_masks_dir", type=str, default="", help="Use precomputed supervision masks from this directory (overrides default <output_dir>/sup_masks)")
+    # Static selection for few_slices
+    p.add_argument("--slice_sel_json", type=str, default="", help="Optional selected_slices.json to precompute static sup masks for few_slices")
     # Static masks from selected points (1% seeds) and dense pseudo labels
     p.add_argument(
         "--selected_points_dir",
