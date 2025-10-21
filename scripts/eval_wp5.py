@@ -12,8 +12,8 @@ Examples:
   python scripts/eval_wp5.py \
     --ckpt runs/grid_clip_zscore/scratch_subset_100/last.ckpt \
     --datalist datalist_test.json \
-    --output_dir runs/grid_clip_zscore/scratch_subset_100_eval \
-    --save_preds
+    --output_dir runs/grid_clip_zscore/scratch_subset_100/eval \
+    --save_preds --heavy --hd_percentile 95 --empty_pair_policy count_as_one
 
 Or build the test list via WP5 split config:
   python scripts/eval_wp5.py \
@@ -89,9 +89,9 @@ def build_model(args) -> torch.nn.Module:
 
 
 def main():
-    p = argparse.ArgumentParser("WP5 evaluation (Dice/IoU, save predictions)")
+    p = argparse.ArgumentParser("WP5 evaluation (Dice/IoU, HD/ASD, save predictions)")
     p.add_argument("--ckpt", type=str, required=True, help="Checkpoint path (state_dict or container)")
-    p.add_argument("--output_dir", type=str, required=True, help="Where to save metrics/predictions")
+    p.add_argument("--output_dir", type=str, required=True, help="Base dir to save metrics/predictions (timestamp appended unless --no_timestamp)")
     # Dataset
     p.add_argument("--datalist", type=str, default="datalist_test.json", help="JSON list for test set")
     p.add_argument("--data_root", type=str, default="", help="WP5 dataset root (if not using --datalist)")
@@ -108,10 +108,17 @@ def main():
     p.add_argument("--save_preds", action="store_true", help="Save predictions as NIfTI under <output_dir>/preds")
     p.add_argument("--max_cases", type=int, default=-1, help="Limit number of evaluated cases (for smoke tests)")
     p.add_argument("--heavy", action="store_true", help="Also compute HD/ASD (slower)")
+    p.add_argument("--hd_percentile", type=float, default=95.0, help="Hausdorff percentile: 95.0 for HD95, 100.0 for full HD")
+    p.add_argument("--empty_pair_policy", type=str, default="count_as_one", choices=["exclude", "count_as_one"], help="When both pred and GT are empty: 'count_as_one' (score 1.0) or 'exclude' (skip)")
+    p.add_argument("--no_timestamp", action="store_true", help="Do not append timestamp to --output_dir")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(args.output_dir)
+    if not args.no_timestamp:
+        import time as _time
+        ts = _time.strftime("%Y%m%d-%H%M%S")
+        out_dir = out_dir.parent / f"{out_dir.name}_{ts}"
     (out_dir / "metrics").mkdir(parents=True, exist_ok=True)
 
     # Dataset
@@ -145,6 +152,8 @@ def main():
         save_preds=args.save_preds,
         max_cases=(None if args.max_cases < 0 else args.max_cases),
         heavy=bool(args.heavy),
+        empty_pair_policy=str(args.empty_pair_policy),
+        hd_percentile=float(args.hd_percentile),
     )
     (out_dir / "metrics" / "summary.json").write_text(json.dumps(metrics, indent=2))
 
