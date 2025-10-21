@@ -69,6 +69,7 @@ Example mappers:
 - Metrics: Compute metrics over classes `0,1,2,3,4` and ignore class `6` by default.
   - This keeps continuity with prior experiments where the “last class” was ignored.
   - If using MONAI metrics, either drop channel 6 from predictions or mask GT voxels with value 6 before metric computation.
+  - Both-empty policy (standard): when a class is absent in both prediction and GT for a case, treat the score as 1.0 (Dice/IoU). Use present-only or exclude-empty variants only for exploratory analyses.
 
 **3D vs 2.5D**
 - Both stored as 3D NIfTI volumes with varying shapes.

@@ -8,6 +8,10 @@ Key references in this repo:
 
 Scope: All code under this directory. Keep changes minimal, adopt MONAI idioms, avoid leaking domain‑specific assumptions unless documented here.
 
+## Command Presentation (for agents)
+- Always show runnable Python and shell commands in a single line when responding. This avoids terminals treating only the first line as the command and silently dropping subsequent flags when users paste multi‑line snippets.
+- Prefer explicit flags and full paths where helpful for reproducibility.
+
 ## Environment
 - Python: 3.8+ recommended.
 - Install MONAI (if not using this repo in editable mode): `pip install -e .` from this folder or `pip install monai[all]` in a fresh venv.
@@ -236,6 +240,11 @@ json.dump([train[i] for i in few], open('datalist_train_1pct.json','w'), indent=
 ## Reproducibility & Logging
 - Set seeds: `torch`, `numpy`, `monai.utils.set_determinism(seed=42)`.
 - Log with TensorBoard (`SummaryWriter`) or MONAI handlers; store checkpoints with epoch, Dice score, and config snapshot.
+
+### Run/Log Folder Policy (local convention)
+- Training stdout/stderr should be written inside the run’s own folder (the same folder that contains checkpoints and metrics), typically as `train.log`.
+- Evaluation/inference stdout/stderr should be written inside the corresponding `*_eval` folder (the same folder that contains `metrics/summary.json` and optional `preds/`), typically as `eval.log`.
+- For re-evaluations, reuse the original run folder name and append `_eval` (do not append timestamps). Overwrite `metrics/summary.json` when re-running.
 
 ## Pitfalls
 - Ignoring class 6: ensure consistency across loss and metrics.

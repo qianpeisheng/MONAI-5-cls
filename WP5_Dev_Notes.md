@@ -43,6 +43,9 @@ Usage examples
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_slices --fewshot_ratio 0.1 --fs_axis_mode z --output_dir runs/fewslice_z_10pct ...`
 - Few-slices (1%, multi-axis):
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_slices --fewshot_ratio 0.01 --fs_axis_mode multi --output_dir runs/fewslice_multi_1pct ...`
+  - Alternate static selection (simpler heuristic): first pick slices where classes 0..4 all appear (ignore 6), sample randomly to 1% budget across all axes, then train with fixed sup masks:
+    - `python3 scripts/select_informative_slices.py --train_list datalist_train.json --out_dir runs/selected_slices_allcls_1pct_$(date +%Y%m%d-%H%M%S) --percent 0.01 --selector all_classes_random --save_sup_masks`
+    - Then launch training using the produced `sup_masks/` directory with `--fewshot_mode few_slices --fewshot_static --sup_masks_dir <that_dir>`.
 - Few-points (10%, dilate=1):
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_points --fewshot_ratio 0.1 --fp_dilate_radius 1 --output_dir runs/fewpoints_10pct ...`
 
@@ -98,11 +101,11 @@ References
 
 Additions and fixes — 2025-10-09
 
-- Configurable evaluation of both-empty cases
-  - New CLI flag `--empty_pair_policy {exclude,count_as_one}` controls how per-class metrics aggregate cases where both prediction and GT are empty:
-    - `exclude` (default): skip such cases from the average (prevents rare-class inflation).
-    - `count_as_one`: treat such cases as perfect (old behavior used in some baselines).
-  - Plumbed through both training-time quick eval and inference-time eval.
+- Configurable evaluation of both-empty cases (standardized)
+  - CLI flag `--empty_pair_policy {exclude,count_as_one}` controls how per-class metrics aggregate cases where both prediction and GT are empty.
+  - Default is now `count_as_one` (standard reporting): when a class is absent in both prediction and GT for a case, score 1.0 for Dice/IoU.
+  - Use `exclude` only for exploratory analyses to avoid rare-class inflation.
+  - Applied consistently in training-time eval and inference-time eval.
   - Files: `train_finetune_wp5.py` (`compute_metrics`, `evaluate`, CLI arg parsing).
 
 - Orientation-safe mask precompute in static few-points
