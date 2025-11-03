@@ -44,6 +44,30 @@ if str(ROOT) not in sys.path:
 import train_finetune_wp5 as tfw
 
 
+def _init_eval_logging(out_dir: Path, enable: bool = True, filename: str = "eval.log") -> None:
+    if not enable:
+        return
+    (out_dir).mkdir(parents=True, exist_ok=True)
+    logp = out_dir / filename
+    fh = open(logp, "a", buffering=1, encoding="utf-8")
+
+    class Tee:
+        def __init__(self, stream, mirror):
+            self.stream = stream
+            self.mirror = mirror
+        def write(self, s):
+            self.stream.write(s)
+            self.mirror.write(s)
+            return len(s)
+        def flush(self):
+            self.stream.flush()
+            self.mirror.flush()
+
+    import sys
+    sys.stdout = Tee(sys.__stdout__, fh)  # type: ignore[assignment]
+    sys.stderr = Tee(sys.__stderr__, fh)  # type: ignore[assignment]
+
+
 def load_test_list(args) -> List[Dict]:
     if args.datalist and Path(args.datalist).exists():
         return json.loads(Path(args.datalist).read_text())
@@ -88,7 +112,7 @@ def build_model(args) -> torch.nn.Module:
     return tfw.build_model(args.net)
 
 
-def main():
+def get_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser("WP5 evaluation (Dice/IoU, HD/ASD, save predictions)")
     p.add_argument("--ckpt", type=str, required=True, help="Checkpoint path (state_dict or container)")
     p.add_argument("--output_dir", type=str, required=True, help="Base dir to save metrics/predictions (timestamp appended unless --no_timestamp)")
@@ -109,8 +133,15 @@ def main():
     p.add_argument("--max_cases", type=int, default=-1, help="Limit number of evaluated cases (for smoke tests)")
     p.add_argument("--heavy", action="store_true", help="Also compute HD/ASD (slower)")
     p.add_argument("--hd_percentile", type=float, default=95.0, help="Hausdorff percentile: 95.0 for HD95, 100.0 for full HD")
-    p.add_argument("--empty_pair_policy", type=str, default="count_as_one", choices=["exclude", "count_as_one"], help="When both pred and GT are empty: 'count_as_one' (score 1.0) or 'exclude' (skip)")
     p.add_argument("--no_timestamp", action="store_true", help="Do not append timestamp to --output_dir")
+    # logging
+    p.add_argument("--log_to_file", action="store_true", help="Tee stdout/stderr to <output_dir>/eval.log")
+    p.add_argument("--log_file_name", type=str, default="eval.log", help="Eval log filename")
+    return p
+
+
+def main():
+    p = get_parser()
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -120,6 +151,7 @@ def main():
         ts = _time.strftime("%Y%m%d-%H%M%S")
         out_dir = out_dir.parent / f"{out_dir.name}_{ts}"
     (out_dir / "metrics").mkdir(parents=True, exist_ok=True)
+    _init_eval_logging(out_dir=out_dir, enable=bool(getattr(args, "log_to_file", False)), filename=str(getattr(args, "log_file_name", "eval.log")))
 
     # Dataset
     test_list = load_test_list(args)
@@ -152,7 +184,6 @@ def main():
         save_preds=args.save_preds,
         max_cases=(None if args.max_cases < 0 else args.max_cases),
         heavy=bool(args.heavy),
-        empty_pair_policy=str(args.empty_pair_policy),
         hd_percentile=float(args.hd_percentile),
     )
     (out_dir / "metrics" / "summary.json").write_text(json.dumps(metrics, indent=2))

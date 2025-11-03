@@ -168,21 +168,21 @@ def plot_class_surfaces_four_panel(
     dpi: int = 300,
 ) -> None:
     fig = plt.figure(figsize=(12, 4.5), dpi=dpi)
-    fig.suptitle(f"{case_id} — class {cls}", fontsize=12)
+    fig.suptitle(f"{case_id} — class {cls}", fontsize=18, fontweight='bold')
 
     def add_panel(ax, mask: Optional[np.ndarray], title: str, color: str):
-        ax.set_title(f"{title} (class {cls})")
+        ax.set_title(f"{title} (class {cls})", fontsize=14, fontweight='bold')
         ax.set_axis_off()
         if mask is None:
-            ax.text2D(0.5, 0.5, 'N/A', transform=ax.transAxes, ha='center', va='center')
+            ax.text2D(0.5, 0.5, 'N/A', transform=ax.transAxes, ha='center', va='center', fontsize=13, fontweight='bold')
             return
         m = (mask == cls).astype(np.uint8)
         if not m.any():
-            ax.text2D(0.5, 0.5, 'No voxels', transform=ax.transAxes, ha='center', va='center')
+            ax.text2D(0.5, 0.5, 'No voxels', transform=ax.transAxes, ha='center', va='center', fontsize=13, fontweight='bold')
             return
         mesh = extract_mesh_from_mask(m, step=step)
         if mesh is None:
-            ax.text2D(0.5, 0.5, 'Mesh failed', transform=ax.transAxes, ha='center', va='center')
+            ax.text2D(0.5, 0.5, 'Mesh failed', transform=ax.transAxes, ha='center', va='center', fontsize=13, fontweight='bold')
             return
         verts, faces = mesh
         ax.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color=color, linewidth=0.1, antialiased=True, alpha=opacity)

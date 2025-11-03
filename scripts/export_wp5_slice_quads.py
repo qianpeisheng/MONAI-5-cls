@@ -197,31 +197,31 @@ def draw_and_save_quad(
     vmin, vmax = robust_minmax(img2d)
 
     fig, axes = plt.subplots(1, 4, figsize=(16, 4.8), dpi=dpi)
-    fig.suptitle(f"{case_id} — {axis} slice {index+1}/{nslices_axis}", fontsize=12)
+    fig.suptitle(f"{case_id} — {axis} slice {index+1}/{nslices_axis}", fontsize=18, fontweight='bold')
     # Panel 1: Data
     axes[0].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
-    axes[0].set_title("Data", fontsize=11)
+    axes[0].set_title("Data", fontsize=14, fontweight='bold')
     axes[0].axis("off")
 
     # Panel 2: GT overlay
     axes[1].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
     if lbl2d is not None:
         axes[1].imshow(colorize_seg2d(lbl2d.T, alpha=alpha), origin="lower")
-    axes[1].set_title("Ground Truth", fontsize=11)
+    axes[1].set_title("Ground Truth", fontsize=14, fontweight='bold')
     axes[1].axis("off")
 
     # Panel 3: Fully Supervised overlay
     axes[2].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
     if pf2d is not None:
         axes[2].imshow(colorize_seg2d(pf2d.T, alpha=alpha), origin="lower")
-    axes[2].set_title("Fully Supervised", fontsize=11)
+    axes[2].set_title("Fully Supervised", fontsize=14, fontweight='bold')
     axes[2].axis("off")
 
     # Panel 4: 1% Voxel overlay
     axes[3].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
     if pv2d is not None:
         axes[3].imshow(colorize_seg2d(pv2d.T, alpha=alpha), origin="lower")
-    axes[3].set_title("1% Voxel", fontsize=11)
+    axes[3].set_title("1% Voxel", fontsize=14, fontweight='bold')
     axes[3].axis("off")
 
     plt.tight_layout()

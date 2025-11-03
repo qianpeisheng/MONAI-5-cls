@@ -727,7 +727,7 @@ def main():
         st.warning("Datalist is empty or could not be loaded.")
         st.stop()
 
-    case_ids = [r.get("id", f"case_{i}") for i, r in enumerate(records)]
+    case_ids = sorted([r.get("id", f"case_{i}") for i, r in enumerate(records)])
     case_sel = st.selectbox("Select case", options=case_ids, index=0)
     rec = next(r for r in records if r.get("id") == case_sel)
     img_path = Path(rec["image"]) if rec.get("image") else None

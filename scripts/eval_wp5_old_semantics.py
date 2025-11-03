@@ -21,10 +21,8 @@ from typing import Dict, Optional, Tuple
 
 import numpy as np
 
-try:
-    import nibabel as nib  # type: ignore
-except Exception:
-    nib = None
+import sys
+sys.exit("DEPRECATED: Use scripts/eval_wp5.py. Official evaluation sets both-empty=1.0; this script is disabled.")
 
 
 def load_json(path: Path):
@@ -183,4 +181,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

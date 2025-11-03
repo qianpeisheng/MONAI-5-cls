@@ -22,15 +22,13 @@ Optionally, train from a pretrained checkpoint (non-strict load for head):
 Train from scratch explicitly:
   python train_finetune_wp5.py --mode train --init scratch --output_dir runs/wp5_finetune_scratch
 
-Evaluate a saved checkpoint on the test set (preferred):
+Evaluate a saved checkpoint on the test set:
   # Use the dedicated evaluator (timestamps + HD95/HD + policy metadata)
   python scripts/eval_wp5.py \
     --ckpt runs/wp5_finetune_full/best.ckpt \
     --datalist datalist_test.json \
     --output_dir runs/wp5_finetune_full/eval \
-    --save_preds --heavy --hd_percentile 95 --empty_pair_policy count_as_one
-
-Deprecated (avoid): `--mode infer` in this script. Prefer scripts/eval_wp5.py for evaluation.
+    --save_preds --heavy --hd_percentile 95
 
 Notes:
 - Label policy: evaluate classes 0..4 (background included), ignore class 6 in loss/metrics.
@@ -74,6 +72,8 @@ from monai.transforms import (
     RandScaleIntensityd,
 )
 from monai.utils import set_determinism
+import sys
+import logging
 try:
     from monai.optimizers import Novograd  # preferred optimizer per MONAI bundle
 except Exception:  # pragma: no cover
@@ -960,7 +960,6 @@ def compute_metrics(
     pred: torch.Tensor,
     gt: torch.Tensor,
     heavy: bool = True,
-    empty_pair_policy: str = "count_as_one",
     hd_percentile: float = 100.0,
 ) -> Dict[int, Dict[str, float]]:
     """Compute per-class Dice, IoU, and optionally HD/ASD for classes 0..4; ignore class 6.
@@ -968,9 +967,7 @@ def compute_metrics(
     Parameters
     - pred, gt: shaped (B,1,X,Y,Z)
     - heavy: include HD/ASD if True
-    - empty_pair_policy:
-        - "exclude": samples where both pred and GT are empty for a class are skipped in averaging
-        - "count_as_one": those samples contribute 1.0 to Dice/IoU
+    - Policy: when a class is absent in both prediction and GT for a class/case, score 1.0 (both-empty=1.0)
     """
     B = pred.shape[0]
     ignore_mask = (gt != 6)
@@ -1005,10 +1002,9 @@ def compute_metrics(
         iou_vals = np.zeros_like(inter[valid], dtype=np.float32)
         iou_vals[iou_valid] = inter[valid][iou_valid] / (uni[valid][iou_valid] + 1e-8)
         iou[valid] = iou_vals
-        # handle both-empty policy
-        if empty_pair_policy == "count_as_one":
-            dice[both_empty] = 1.0
-            iou[both_empty] = 1.0
+        # Official policy: both-empty contribute 1.0
+        dice[both_empty] = 1.0
+        iou[both_empty] = 1.0
 
         if heavy:
             # HD & ASD handling for empties
@@ -1466,7 +1462,6 @@ def evaluate(
     save_preds: bool = False,
     max_cases: int | None = None,
     heavy: bool = True,
-    empty_pair_policy: str = "count_as_one",
     hd_percentile: float = 100.0,
 ) -> Dict[str, Dict]:
     net.eval()
@@ -1530,7 +1525,6 @@ def evaluate(
                 pred.cpu(),
                 gt.cpu(),
                 heavy=heavy,
-                empty_pair_policy=empty_pair_policy,
                 hd_percentile=hd_percentile,
             )
             for c in classes:
@@ -1564,7 +1558,7 @@ def evaluate(
         "asd": float(np.mean([summary[str(c)]["asd"] for c in classes if summary[str(c)]["asd"] is not None])) if heavy else None,
     }
     meta = {
-        "empty_pair_policy": empty_pair_policy,
+        "empty_pair_policy": "count_as_one",
         "heavy": bool(heavy),
         "hd_percentile": float(hd_percentile),
         "classes": [0, 1, 2, 3, 4],
@@ -1584,6 +1578,13 @@ def train(args):
     split_cfg = Path(args.split_cfg)
     out_dir = Path(args.output_dir)
     (out_dir / "metrics").mkdir(parents=True, exist_ok=True)
+    # initialize run logging once outputs are resolved
+    _init_run_logging(out_dir=str(out_dir), enable=bool(getattr(args, "log_to_file", True)), filename=str(getattr(args, "log_file_name", "train.log")))
+    # persist args for reproducibility
+    try:
+        (out_dir / "args.json").write_text(json.dumps(vars(args), indent=2, default=str))
+    except Exception:
+        pass
 
     # Build datalists and optionally subset train
     train_list, test_list = build_datalists(data_root / "data", split_cfg)
@@ -1681,22 +1682,20 @@ def train(args):
         print(f"Built network from bundle: {args.bundle_dir}")
     else:
         net = build_model(args.net).to(device)
-    # Initialization policy
+    # Initialization policy (clear and unambiguous)
     if args.init == "pretrained":
         if args.pretrained_ckpt and Path(args.pretrained_ckpt).exists():
             print(f"Initializing from pretrained checkpoint: {args.pretrained_ckpt}")
             load_pretrained_non_strict(net, Path(args.pretrained_ckpt), device)
         else:
             print(
-                f"WARNING: --init pretrained requested but --pretrained_ckpt not found: {args.pretrained_ckpt}. Proceeding without pretrained weights."
+                f"WARNING: --init pretrained requested but --pretrained_ckpt not found: {args.pretrained_ckpt}. Proceeding with random initialization."
             )
+            reinitialize_weights(net)
     else:
-        print("Initializing model from scratch (reinitialized weights for fair comparison)")
-        # For fair comparison, follow the same code path as pretrained: 
-        # if a checkpoint is available, load then reinitialize; otherwise just reinitialize
-        if args.pretrained_ckpt and Path(args.pretrained_ckpt).exists():
-            print(f"(scratch) Loading then reinitializing from: {args.pretrained_ckpt}")
-            load_pretrained_non_strict(net, Path(args.pretrained_ckpt), device)
+        if args.pretrained_ckpt:
+            print("INFO: --init scratch set; ignoring --pretrained_ckpt.")
+        print("Initializing model from scratch.")
         reinitialize_weights(net)
 
     # Use bundle-aligned LRs by default (higher than before)
@@ -1715,8 +1714,11 @@ def train(args):
     roi = (args.roi_x, args.roi_y, args.roi_z)
 
     # Log basic run config once
+    # Report parameter count and config
+    n_params = sum(p.numel() for p in net.parameters())
     print(
-        f"Run config: init={args.init}, net={'bundle' if args.bundle_dir else args.net}, optimizer={opt_name}, base_lr={base_lr:.2e}, epochs={args.epochs}, milestones={milestones}"
+        f"Run config: init={args.init}, net={'bundle' if args.bundle_dir else args.net}, params={n_params/1e6:.2f}M, "
+        f"optimizer={opt_name}, base_lr={base_lr:.2e}, epochs={args.epochs}, milestones={milestones}"
     )
 
     for epoch in range(1, args.epochs + 1):
@@ -1948,7 +1950,6 @@ def train(args):
             save_preds=False,
             max_cases=None,
             heavy=False,
-            empty_pair_policy=getattr(args, "empty_pair_policy", "count_as_one"),
             hd_percentile=getattr(args, "hd_percentile", 100.0),
         )
         avg_dice = metrics["average"]["dice"]
@@ -1984,57 +1985,39 @@ def train(args):
     print(f"Training complete. Best avg Dice (0..4): {best_dice:.4f}")
 
 
-def infer(args):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    set_seed(args.seed)
+def _init_run_logging(out_dir: str, enable: bool = True, filename: str = "train.log") -> None:
+    """Set up a simple tee for stdout/stderr to a log file.
 
-    data_root = Path(args.data_root)
-    split_cfg = Path(args.split_cfg)
-    out_dir = Path(args.output_dir)
-    (out_dir / "metrics").mkdir(parents=True, exist_ok=True)
+    This catches print() output without requiring shell `tee`.
+    """
+    if not enable:
+        return
+    path = Path(out_dir) / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path, "a", buffering=1, encoding="utf-8")
 
-    # Build test list
-    _, test_list = build_datalists(data_root / "data", split_cfg)
-    _, t_val = get_transforms(roi=(args.roi_x, args.roi_y, args.roi_z), norm=args.norm)
-    ds_test = Dataset(test_list, transform=t_val)
-    dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
+    class Tee:
+        def __init__(self, stream, mirror):
+            self.stream = stream
+            self.mirror = mirror
 
-    # Build network matching the training architecture
-    if args.bundle_dir:
-        bundle_path = Path(args.bundle_dir)
-        if not bundle_path.exists():
-            raise FileNotFoundError(f"--bundle_dir provided but not found: {bundle_path}")
-        net = build_model_from_bundle(bundle_path, out_channels=5).to(device)
-        print(f"Built network from bundle for inference: {args.bundle_dir}")
-    else:
-        net = build_model(args.net).to(device)
-    if args.ckpt and Path(args.ckpt).exists():
-        sd = torch.load(args.ckpt, map_location=device)
-        sd = sd.get("state_dict", sd) if isinstance(sd, dict) else sd
-        net.load_state_dict(sd, strict=False)
-        print(f"Loaded checkpoint: {args.ckpt}")
-    else:
-        print("No valid checkpoint provided; running with randomly initialized weights.")
+        def write(self, s):
+            self.stream.write(s)
+            self.mirror.write(s)
+            return len(s)
 
-    # Full metrics (including HD/ASD) during inference
-    metrics = evaluate(
-        net,
-        dl_test,
-        device,
-        out_dir,
-        save_preds=args.save_preds,
-        max_cases=None,
-        heavy=True,
-        empty_pair_policy=getattr(args, "empty_pair_policy", "count_as_one"),
-        hd_percentile=getattr(args, "hd_percentile", 100.0),
-    )
-    (out_dir / "metrics" / "summary.json").write_text(json.dumps(metrics, indent=2))
-    print("Inference complete. Metrics saved.")
+        def flush(self):
+            self.stream.flush()
+            self.mirror.flush()
+
+    import io as _io
+    sys.stdout = Tee(sys.__stdout__, fh)  # type: ignore[assignment]
+    sys.stderr = Tee(sys.__stderr__, fh)  # type: ignore[assignment]
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="WP5 Fine-tuning & Inference (MONAI)")
-    p.add_argument("--mode", choices=["train", "infer"], default="train", help="Run mode")
+def parse_args(argv: List[str] | None = None):
+    p = argparse.ArgumentParser(description="WP5 Fine-tuning (use scripts/eval_wp5.py for evaluation)")
+    p.add_argument("--mode", choices=["train"], default="train", help="Run mode (only 'train' supported)")
     p.add_argument("--data_root", type=str, default="/data3/wp5/wp5-code/dataloaders/wp5-dataset", help="WP5 dataset root (contains data/)")
     p.add_argument("--split_cfg", type=str, default="/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json", help="Predefined split config JSON")
     p.add_argument("--output_dir", type=str, default="runs/wp5_finetune", help="Output directory (base path)")
@@ -2067,16 +2050,7 @@ def parse_args():
     p.add_argument("--bundle_dir", type=str, default="", help="Path to MONAI bundle directory (with configs/ and models/)")
     p.add_argument("--ckpt", type=str, default="", help="Checkpoint to load for inference")
     p.add_argument("--save_preds", action="store_true", help="Save predictions during inference")
-    p.add_argument(
-        "--empty_pair_policy",
-        type=str,
-        default="count_as_one",
-        choices=["exclude", "count_as_one"],
-        help=(
-            "When a class is absent in both prediction and GT for a case: "
-            "'count_as_one' (default; standard reporting, score 1.0) or 'exclude' (skip from averaging; exploration only)"
-        ),
-    )
+    # Official evaluation semantics are fixed (both-empty=1.0). Use scripts/eval_wp5.py to evaluate.
     p.add_argument(
         "--hd_percentile",
         type=float,
@@ -2164,7 +2138,10 @@ def parse_args():
         action="store_true",
         help="Do not append timestamp to --output_dir (default behavior appends _YYYYmmdd-HHMMSS)",
     )
-    return p.parse_args()
+    # Logging
+    p.add_argument("--log_to_file", action="store_true", default=True, help="Tee stdout/stderr to <output_dir>/train.log")
+    p.add_argument("--log_file_name", type=str, default="train.log", help="Training log filename")
+    return p.parse_args(argv)
 
 
 if __name__ == "__main__":
@@ -2176,7 +2153,5 @@ if __name__ == "__main__":
         args.output_dir = str(base.parent / f"{base.name}_{ts}")
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     print(f"Using output directory: {args.output_dir}")
-    if args.mode == "train":
-        train(args)
-    else:
-        infer(args)
+    # Only train mode is supported; evaluation is handled by scripts/eval_wp5.py
+    train(args)
