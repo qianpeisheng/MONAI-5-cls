@@ -1,0 +1,12 @@
+precedence: [3, 2, 1, 4, 0]
+# Pairs that must not overlap (symmetric)
+disjoint_pairs:
+  - [0, 1]
+  - [0, 2]
+  - [0, 4]
+  - [1, 2]
+  - [1, 4]
+  - [2, 4]
+# Inclusive relations child inside parent (child ⊂ parent)
+inclusive:
+  - [3, 2]

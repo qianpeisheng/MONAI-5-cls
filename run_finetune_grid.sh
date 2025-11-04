@@ -136,7 +136,6 @@ run_chain() {
         --subset_ratio "$r" \
         --seed "$SEED" \
         --net basicunet \
-        ${BUNDLE_DIR:+--bundle_dir "$BUNDLE_DIR"} \
         --init scratch \
         --pretrained_ckpt "$PRETRAINED_CKPT" | tee "$out/train.log"
     fi

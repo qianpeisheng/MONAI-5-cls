@@ -43,6 +43,9 @@ Usage examples
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_slices --fewshot_ratio 0.1 --fs_axis_mode z --output_dir runs/fewslice_z_10pct ...`
 - Few-slices (1%, multi-axis):
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_slices --fewshot_ratio 0.01 --fs_axis_mode multi --output_dir runs/fewslice_multi_1pct ...`
+  - Alternate static selection (simpler heuristic): first pick slices where classes 0..4 all appear (ignore 6), sample randomly to 1% budget across all axes, then train with fixed sup masks:
+    - `python3 scripts/select_informative_slices.py --train_list datalist_train.json --out_dir runs/selected_slices_allcls_1pct_$(date +%Y%m%d-%H%M%S) --percent 0.01 --selector all_classes_random --save_sup_masks`
+    - Then launch training using the produced `sup_masks/` directory with `--fewshot_mode few_slices --fewshot_static --sup_masks_dir <that_dir>`.
 - Few-points (10%, dilate=1):
   - `python3 train_finetune_wp5.py --mode train --init scratch --fewshot_mode few_points --fewshot_ratio 0.1 --fp_dilate_radius 1 --output_dir runs/fewpoints_10pct ...`
 
@@ -93,3 +96,63 @@ References
 
 - Source ideas for normalization: `/data3/wp5/wp5-code/dataloaders/wp5.py` (`get_normalization_transform('clip_zscore', per_sample=True)`).
 - Policy reference: `WP5_Segmentation_Data_Guide.md` (robust per-sample normalization and ignore class 6).
+
+---
+
+Additions and fixes — 2025-10-09
+
+- Configurable evaluation of both-empty cases (standardized)
+  - CLI flag `--empty_pair_policy {exclude,count_as_one}` controls how per-class metrics aggregate cases where both prediction and GT are empty.
+  - Default is now `count_as_one` (standard reporting): when a class is absent in both prediction and GT for a case, score 1.0 for Dice/IoU.
+  - Use `exclude` only for exploratory analyses to avoid rare-class inflation.
+  - Applied consistently in training-time eval and inference-time eval.
+  - Files: `train_finetune_wp5.py` (`compute_metrics`, `evaluate`, CLI arg parsing).
+
+- Orientation-safe mask precompute in static few-points
+  - Internal loader for labels when precomputing static seed/supervision masks now uses MONAI `LoadImaged+Orientationd(axcodes='RAS')` for consistency with train-time transforms.
+  - File: `train_finetune_wp5.py` (`_load_label_volume`).
+
+- Old-semantics evaluator script
+  - New helper: `scripts/eval_wp5_old_semantics.py` to re-evaluate existing predictions with the old both-empty=1 convention.
+  - Usage:
+    - `python scripts/eval_wp5_old_semantics.py --pred_dir <run>/preds --datalist datalist_test.json --out <run>/metrics/summary_old_semantics.json`.
+
+- Streamlit viewer: few-shot comparison
+  - Added a second predictions directory input to compare fully supervised vs few-shot outputs side-by-side (+GT) in 2D and 3D.
+  - Default dirs:
+    - Fully supervised: `/home/peisheng/MONAI/runs/grid_clip_zscore/pretrained_subset_100_eval/preds`.
+    - Few-shot 0.001%: `/home/peisheng/MONAI/runs/fixed_points_scratch50/ratio_0.00001_infer_20251009-154947/preds`.
+  - Files: `scripts/vis_wp5_streamlit.py` (adds `--pred_dir2`, triplet 2D view, dual 3D view, per-class Dice per pred).
+
+- Extreme few-points run scripts
+  - New: `scripts/run_fixed_points_ratio_1e6.sh` to run ratio=1e-6 (0.000001) few-points from scratch on a chosen GPU.
+  - Updated: `scripts/run_fixed_points_bundle_extremes_50ep.sh` now runs from scratch (BasicUNet), launches two ratios concurrently, and writes to stable output dirs.
+
+- Training loop robustness
+  - Fixed an indentation bug around per-epoch evaluation in `train_finetune_wp5.py`.
+
+Notes
+
+- These changes keep MONAI idioms and WP5 label policy (ignore class 6) intact.
+- For few-points `uniform_all` sampling with ignore-6, consider `--fp_uniform_exclude6` to avoid allocating seeds to class 6.
+
+---
+
+External Precompute Workflow (1% points)
+
+- Precompute static masks (uniform per-scan 1% of voxels, no dilation):
+  - `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/precompute_sup_masks.py --mode few_points_global --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --subset_ratio 1.0 --ratio 0.01 --dilate_radius 0 --balance proportional --seed 42 --fp_sample_mode uniform_all --out_dir runs/sup_masks_1pct_uniform_all`
+- Train with precomputed masks:
+  - `. /home/peisheng/MONAI/venv/bin/activate && CUDA_VISIBLE_DEVICES=1 python3 -u train_finetune_wp5.py --mode train --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --output_dir runs/fewpoints_01pct_static_from_dir --epochs 20 --batch_size 2 --num_workers 4 --init scratch --net basicunet --subset_ratio 1.0 --seed 42 --fewshot_mode few_points --fewshot_ratio 0.01 --fewshot_static --sup_masks_dir runs/sup_masks_1pct_uniform_all --pseudo_weight 0.0 --fg_crop_prob 0.0 --coverage_mode seeds --norm clip_zscore --roi_x 112 --roi_y 112 --roi_z 80 --log_to_file`
+
+Evaluation (single evaluator; official semantics)
+
+- Use `scripts/eval_wp5.py` for all evaluations; in-script trainer eval has been removed.
+- Official policy: evaluate classes 0..4 (ignore label 6) and when both prediction and GT are empty for a class in a volume count the score as 1.0.
+- Example command:
+  - `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/eval_wp5.py --ckpt <run>/last.ckpt --datalist datalist_test.json --output_dir <run>_eval --no_timestamp --heavy --hd_percentile 95 --log_to_file`
+
+Known-good environment (WP5)
+
+- Python 3.9.5, torch 2.8.0+cu128, MONAI 1.5.1
+- Confirm with: `. /home/peisheng/MONAI/venv/bin/activate && python -c "import torch, monai; print(torch.__version__, monai.__version__)"`

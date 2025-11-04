@@ -165,3 +165,8 @@ runs
 *.pth
 
 *zarr/*
+ 
+# WP5 local outputs and MONAI bundles
+output*.png
+pretrained_models/**/models/*.pt
+pretrained_models/**/models/*.ts
