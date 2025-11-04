@@ -135,3 +135,24 @@ Notes
 
 - These changes keep MONAI idioms and WP5 label policy (ignore class 6) intact.
 - For few-points `uniform_all` sampling with ignore-6, consider `--fp_uniform_exclude6` to avoid allocating seeds to class 6.
+
+---
+
+External Precompute Workflow (1% points)
+
+- Precompute static masks (uniform per-scan 1% of voxels, no dilation):
+  - `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/precompute_sup_masks.py --mode few_points_global --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --subset_ratio 1.0 --ratio 0.01 --dilate_radius 0 --balance proportional --seed 42 --fp_sample_mode uniform_all --out_dir runs/sup_masks_1pct_uniform_all`
+- Train with precomputed masks:
+  - `. /home/peisheng/MONAI/venv/bin/activate && CUDA_VISIBLE_DEVICES=1 python3 -u train_finetune_wp5.py --mode train --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --output_dir runs/fewpoints_01pct_static_from_dir --epochs 20 --batch_size 2 --num_workers 4 --init scratch --net basicunet --subset_ratio 1.0 --seed 42 --fewshot_mode few_points --fewshot_ratio 0.01 --fewshot_static --sup_masks_dir runs/sup_masks_1pct_uniform_all --pseudo_weight 0.0 --fg_crop_prob 0.0 --coverage_mode seeds --norm clip_zscore --roi_x 112 --roi_y 112 --roi_z 80 --log_to_file`
+
+Evaluation (single evaluator; official semantics)
+
+- Use `scripts/eval_wp5.py` for all evaluations; in-script trainer eval has been removed.
+- Official policy: evaluate classes 0..4 (ignore label 6) and when both prediction and GT are empty for a class in a volume count the score as 1.0.
+- Example command:
+  - `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/eval_wp5.py --ckpt <run>/last.ckpt --datalist datalist_test.json --output_dir <run>_eval --no_timestamp --heavy --hd_percentile 95 --log_to_file`
+
+Known-good environment (WP5)
+
+- Python 3.9.5, torch 2.8.0+cu128, MONAI 1.5.1
+- Confirm with: `. /home/peisheng/MONAI/venv/bin/activate && python -c "import torch, monai; print(torch.__version__, monai.__version__)"`

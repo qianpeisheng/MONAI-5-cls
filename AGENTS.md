@@ -255,8 +255,10 @@ json.dump([train[i] for i in few], open('datalist_train_1pct.json','w'), indent=
 - `mednist_tutorial.ipynb` — reference for IO/transform patterns.
 - `WP5_Segmentation_Data_Guide.md` — authoritative WP5 data details, label policy, split.
 
-## Evaluation & Metrics
+## Evaluation & Metrics (official)
+- Use `scripts/eval_wp5.py` for all evaluations. In‑script trainer evaluation has been removed.
 - Classes to evaluate: 0–4 (background included), ignore voxels with label 6.
+- When both prediction and GT are empty for a class in a volume, count the score as 1.0 (both‑empty=1.0).
 - Report per‑class and the unweighted average across classes 0–4.
 - Metrics to compute:
   - Dice coefficient (per class and mean)
@@ -309,4 +311,8 @@ Baselines (as provided) — evaluate over classes 0..4, ignore class 6
 | average | 0.20599731 | 0.17555128 | 18.00107008 | 5.29859735 |
 
 Replicating baselines
-- Use the same split (train=380, test=180), same class policy (0..4 evaluated, 6 ignored), and the same metric definitions. If you suspect HD vs HD95 discrepancy, set HD percentile=100 to match these values.
+- Use the same split (train=380, test=180), same class policy (0..4 evaluated, 6 ignored), and the same metric definitions. If you suspect HD vs HD95 discrepancy, set HD percentile=100 to match these values. Both‑empty=1.0 policy is always applied.
+
+External precompute (1% points, no dilation)
+- Precompute: `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/precompute_sup_masks.py --mode few_points_global --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --subset_ratio 1.0 --ratio 0.01 --dilate_radius 0 --balance proportional --seed 42 --fp_sample_mode uniform_all --out_dir runs/sup_masks_1pct_uniform_all`
+- Train: `. /home/peisheng/MONAI/venv/bin/activate && CUDA_VISIBLE_DEVICES=1 python3 -u train_finetune_wp5.py --mode train --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --output_dir runs/fewpoints_01pct_static_from_dir --epochs 20 --batch_size 2 --num_workers 4 --init scratch --net basicunet --subset_ratio 1.0 --seed 42 --fewshot_mode few_points --fewshot_ratio 0.01 --fewshot_static --sup_masks_dir runs/sup_masks_1pct_uniform_all --pseudo_weight 0.0 --fg_crop_prob 0.0 --coverage_mode seeds --norm clip_zscore --roi_x 112 --roi_y 112 --roi_z 80 --log_to_file`
