@@ -57,6 +57,7 @@ run_series() {
         --subset_ratio "${ratio}" \
         --seed 42 \
         ${TS_FLAG}
+        --log_to_file
     )
   done
 }

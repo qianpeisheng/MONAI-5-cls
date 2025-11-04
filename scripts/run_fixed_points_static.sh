@@ -56,6 +56,7 @@ for ratio in "${RATIOS[@]}"; do
     --pseudo_weight 0.0 \
     --fg_crop_prob 0.0 \
     --coverage_mode seeds \
+    --log_to_file \
     $TS_FLAG
 done
 

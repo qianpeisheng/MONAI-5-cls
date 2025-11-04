@@ -2044,7 +2044,7 @@ def parse_args(argv: List[str] | None = None):
         choices=["clip_zscore", "fixed_wp5", "none"],
         help="Image normalization: 'clip_zscore' (p1/p99 clip + z-score), 'fixed_wp5' ([-3,8.5] -> [0,1]), or 'none'",
     )
-    p.add_argument("--net", choices=["basicunet", "unet"], default="basicunet", help="Backbone architecture (default and recommended: basicunet from scratch)")
+    p.add_argument("--net", choices=["basicunet"], default="basicunet", help="Backbone architecture (WP5: basicunet recommended; UNet deprecated)")
     p.add_argument("--init", choices=["scratch", "pretrained"], default="scratch", help="Initialize randomly or load a pretrained checkpoint")
     p.add_argument("--pretrained_ckpt", type=str, default="", help="Checkpoint to initialize weights when --init pretrained")
     p.add_argument("--bundle_dir", type=str, default="", help="Path to MONAI bundle directory (with configs/ and models/)")

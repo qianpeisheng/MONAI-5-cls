@@ -50,7 +50,7 @@ python3 -u train_finetune_wp5.py \
   --pseudo_weight 0.0 \
   --fg_crop_prob 0.0 \
   --coverage_mode seeds \
+  --log_to_file \
   $TS_FLAG
 
 echo "Run complete. Output: $outdir"
-

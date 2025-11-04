@@ -121,7 +121,7 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--data_root", type=str, default="", help="WP5 dataset root (if not using --datalist)")
     p.add_argument("--split_cfg", type=str, default="", help="Split config JSON (if not using --datalist)")
     # Model and transforms
-    p.add_argument("--net", choices=["basicunet", "unet"], default="basicunet")
+    p.add_argument("--net", choices=["basicunet"], default="basicunet")
     p.add_argument("--bundle_dir", type=str, default="", help="MONAI bundle directory (optional)")
     p.add_argument("--norm", choices=["clip_zscore", "fixed_wp5", "none"], default="clip_zscore")
     p.add_argument("--roi_x", type=int, default=112)
