@@ -2027,7 +2027,7 @@ def parse_args(argv: List[str] | None = None):
         default="",
         help="Override training label paths with files from this directory (mirror basenames)",
     )
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for scratch training (Novograd/Adam)")

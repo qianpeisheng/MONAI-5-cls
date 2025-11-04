@@ -12,7 +12,7 @@ set -euo pipefail
 # Config (override via env)
 DATA_ROOT=${DATA_ROOT:-/data3/wp5/wp5-code/dataloaders/wp5-dataset}
 SPLIT_CFG=${SPLIT_CFG:-/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json}
-EPOCHS=${EPOCHS:-50}
+EPOCHS=${EPOCHS:-20}
 BATCH_SIZE=${BATCH_SIZE:-2}
 LR=${LR:-1e-3}
 NUM_WORKERS=${NUM_WORKERS:-4}

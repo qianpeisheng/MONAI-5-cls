@@ -33,7 +33,7 @@ PER_VOLUME_CAP=12
 NMS=3
 
 # Trainer defaults (override by exporting env before running if desired)
-EPOCHS="${EPOCHS:-50}"
+EPOCHS="${EPOCHS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 LR="${LR:-1e-4}"
