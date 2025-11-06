@@ -99,6 +99,36 @@ References
 
 ---
 
+Supervoxel Generation & Sweep (A1/A2)
+
+- Added geometry-aware SLIC modes (A2) to `scripts/gen_supervoxels_wp5.py`:
+  - `--mode slic` (intensity only), `--mode slic-grad-mag` (channels [I, |∇I|]), and `--mode slic-grad-vec` (channels [I, gx, gy, gz]).
+  - `--grad-sigma` controls pre-smoothing before gradient features (default 1.0).
+  - All outputs are RAS-aligned; spacing is respected when computing gradients and SLIC spacing.
+- Added sweep driver `scripts/sweep_supervoxels_wp5.py`:
+  - Sweeps modes, `n_segments`, `compactness`, and `sigma`; runs generation with full-GT voting (ignore 6) and light evaluation.
+  - Writes each run under the configured output root, appends aggregate metrics to `sweep_summary.csv`.
+- Storage layout:
+  - Primary sweep root on fast storage: `/data3/wp5/monai-sv-sweeps`.
+  - Repo convenience symlink: `runs/sv_sweep_ras2 -> /data3/wp5/monai-sv-sweeps` (created).
+
+Manual sweep examples (one line per command)
+
+- Single run (A1 intensity SLIC, 5k):
+  - `python3 scripts/gen_supervoxels_wp5.py --data-root /data3/wp5/wp5-code/dataloaders/wp5-dataset --out-dir runs/sv_sweep_ras2/sv_fullgt_slic_n5000_c0.02_s0.5_ras2 --datalist datalist_train.json --ref-header label --n-segments 5000 --compactness 0.02 --sigma 0.5 --mode slic --assign-all-from-gt --ignore-class 6`
+- Evaluate that run:
+  - `python3 scripts/eval_sv_voted_wp5.py --sv-dir runs/sv_sweep_ras2/sv_fullgt_slic_n5000_c0.02_s0.5_ras2 --sv-ids-dir runs/sv_sweep_ras2/sv_fullgt_slic_n5000_c0.02_s0.5_ras2 --datalist datalist_train.json --data-root /data3/wp5/wp5-code/dataloaders/wp5-dataset --output_dir runs/sv_sweep_ras2/sv_fullgt_slic_n5000_c0.02_s0.5_ras2_eval --ignore-class 6 --num_workers 8 --progress --log_to_file`
+
+Grid sweep (recommended defaults)
+
+- Modes `slic,slic-grad-mag`; `n_segments`: 2000..20000 step 2000; `compactness`: 0.01,0.02,0.05; `sigma`: 0.0,0.5,1.0 (no heavy metrics):
+  - `python3 scripts/sweep_supervoxels_wp5.py --data-root /data3/wp5/wp5-code/dataloaders/wp5-dataset --datalist datalist_train.json --out-root /data3/wp5/monai-sv-sweeps --link-in-runs runs/sv_sweep_ras2 --modes slic,slic-grad-mag --n-seg-min 2000 --n-seg-max 20000 --n-seg-step 2000 --compactness-list 0.01,0.02,0.05 --sigma-list 0.0,0.5,1.0 --grad-sigma 1.0 --ref-header label --ignore-class 6 --eval-workers 8`
+
+Notes
+
+- Evaluation uses official semantics (classes 0..4, ignore GT==6, both-empty=1.0) and records SV diagnostics when IDs are present.
+- For visualization, point Streamlit apps to the symlinked run folders under `runs/sv_sweep_ras2`.
+
 Additions and fixes — 2025-10-09
 
 - Configurable evaluation of both-empty cases (standardized)
