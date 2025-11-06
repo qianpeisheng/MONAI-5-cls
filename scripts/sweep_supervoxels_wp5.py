@@ -41,11 +41,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--eval-workers", type=int, default=4)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--link-in-runs", type=str, default="", help="Optional path (e.g., runs/sv_sweep_ras2) where a symlink to --out-root will be created/updated")
+    p.add_argument("--base-suffix", type=str, default="_ras2", help="Base suffix appended to run names")
+    p.add_argument("--append-suffix", type=str, default="_voted", help="Additional suffix appended to run names (e.g., _voted)")
     return p.parse_args()
 
 
-def _mk_run_name(mode: str, nseg: int, c: float, s: float) -> str:
-    return f"sv_fullgt_{mode}_n{nseg}_c{c}_s{s}_ras2"
+def _mk_run_name(mode: str, nseg: int, c: float, s: float, base_suffix: str, append_suffix: str) -> str:
+    return f"sv_fullgt_{mode}_n{nseg}_c{c}_s{s}{base_suffix}{append_suffix}"
 
 
 def _append_summary(summary_csv: Path, row: dict) -> None:
@@ -118,7 +120,7 @@ def main() -> None:
         for nseg in n_values:
             for c in c_values:
                 for s in s_values:
-                    run_name = _mk_run_name(mode, nseg, c, s)
+                    run_name = _mk_run_name(mode, nseg, c, s, args.base_suffix, args.append_suffix)
             run_dir = out_root / run_name
             eval_dir = out_root / f"{run_name}_eval"
             run_dir.mkdir(parents=True, exist_ok=True)
