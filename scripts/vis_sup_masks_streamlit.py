@@ -145,6 +145,24 @@ def _pclip_zscore(x: np.ndarray, p_low: float = 1.0, p_high: float = 99.0, eps: 
     return (arr - mu) / (sigma + eps)
 
 
+def _colorize_sv_ids(ids2d: np.ndarray, seed: int = 0) -> np.ndarray:
+    """Map integer labels to visually distinct colors using a hash-based colormap.
+
+    Returns an RGB uint8 image of shape (H, W, 3).
+    """
+    ids = ids2d.astype(np.int64)
+    uniq = np.unique(ids)
+    rng = np.random.default_rng(seed)
+    # Assign random distinct colors for each unique id (deterministic by seed)
+    colors = rng.integers(0, 255, size=(uniq.size, 3), dtype=np.uint8)
+    lut = {int(k): colors[i] for i, k in enumerate(uniq)}
+    h, w = ids.shape
+    out = np.zeros((h, w, 3), dtype=np.uint8)
+    for k, c in lut.items():
+        out[ids == k] = c
+    return out
+
+
 def _discover_cases(sup_dir: Path) -> List[str]:
     ids = []
     for p in sorted(sup_dir.glob("*_supmask.npy")):
@@ -187,7 +205,8 @@ def _build_seed_points(seed_mask: np.ndarray) -> Optional[pv.PolyData]:
     if idx.size == 0:
         return None
     # PyVista expects points as (N, 3) float array
-    pts = idx[:, [2, 1, 0]].astype(np.float32)  # order: Z,Y,X -> x,y,z
+    # Map array indices (i,j,k) to visualization axes (x=Z, y=Y, z=X)
+    pts = idx[:, [2, 1, 0]].astype(np.float32)
     cloud = pv.PolyData(pts)
     return cloud
 
@@ -209,6 +228,7 @@ def _surface_from_mask(mask: np.ndarray, iso: float = 0.5, decimate: float = 0.0
     # Build ImageData grid using cell-centered scalars (dims = shape + 1)
     grid = _new_imagedata()
     X, Y, Z = vol.shape
+    # Restore original mapping that is known to produce valid surfaces
     grid.dimensions = (Z + 1, Y + 1, X + 1)  # (nx, ny, nz) in x,y,z
     grid.spacing = (float(ds), float(ds), float(ds))
     grid.origin = (0.0, 0.0, 0.0)
@@ -224,7 +244,13 @@ def _surface_from_mask(mask: np.ndarray, iso: float = 0.5, decimate: float = 0.0
         return None
     if decimate > 0.0 and getattr(surf, "n_points", 0) > 0:
         try:
-            surf = surf.decimate_pro(decimate)
+            orig = surf
+            orig_pts = int(getattr(surf, "n_points", 0))
+            ds_surf = surf.decimate_pro(decimate)
+            if ds_surf is not None and int(getattr(ds_surf, "n_points", 0)) >= max(100, int(0.05 * orig_pts)):
+                surf = ds_surf
+            else:
+                surf = orig
         except Exception:
             pass
     return surf
@@ -283,13 +309,15 @@ def _render_scene(
     # With Xvfb started above, we can render interactively (stpyvista) without forcing off-screen
     plotter = pv.Plotter(off_screen=False, window_size=(1024, 768))
     plotter.set_background("white")
-    # Consistent per-class colors (0..4); 6 is ignored
+    # Consistent per-class colors (0..4); 6 is ignored.
+    # Use a ColorBrewer-like palette with clear separation:
+    #  - 1: red, 2: orange, 3: green, 4: blue
     class_colors = {
-        0: "#b0b0b0",  # background
-        1: "#ff3b30",  # red
-        2: "#ff9500",  # orange
-        3: "#007aff",  # blue
-        4: "#5856d6",  # indigo
+        0: "#b0b0b0",  # gray (background)
+        1: "#e41a1c",  # red
+        2: "#ff7f00",  # orange
+        3: "#4daf4a",  # green
+        4: "#377eb8",  # blue
     }
 
     # Track which classes are visible to assemble a legend later
@@ -301,10 +329,12 @@ def _render_scene(
         plotter.add_volume(grid, **add_kwargs)
 
     # Supervised region surface
+    sup_present = False
     if show_sup and sup_mask is not None:
         surf = _surface_from_mask(sup_mask, iso=0.5, decimate=decimate, downsample=ds_surfaces)
         if surf is not None and getattr(surf, "n_points", 0) > 0:
             plotter.add_mesh(surf, color="#34c759", opacity=sup_opacity, name="sup")
+            sup_present = True
 
     # Label class surfaces
     if show_labels and label is not None:
@@ -336,6 +366,7 @@ def _render_scene(
                 coords = np.argwhere(seeds & (lblv == c))
                 if coords.size == 0:
                     continue
+                # Map indices to visualization axes (x=Z, y=Y, z=X) and apply stride scaling
                 pts = coords[:, [2, 1, 0]].astype(np.float32) * scale
                 cloud = pv.PolyData(pts)
                 plotter.add_points(
@@ -373,6 +404,7 @@ def _render_scene(
                 coords = coords[sel]
             if coords.size > 0:
                 scale = float(int(ds_surfaces)) if int(ds_surfaces) > 1 else 1.0
+                # Map indices to visualization axes (x=Z, y=Y, z=X) and apply stride scaling
                 pts = coords[:, [2, 1, 0]].astype(np.float32) * scale
                 cloud = pv.PolyData(pts)
                 plotter.add_points(cloud, color="#8e8e93", render_points_as_spheres=True, point_size=3, name="unlabeled")
@@ -383,7 +415,7 @@ def _render_scene(
         if c in class_colors:
             label_txt = f"Class {c}" if c != 0 else "Class 0 (bg)"
             legend_entries.append((label_txt, class_colors[c]))
-    if show_sup:
+    if sup_present:
         legend_entries.append(("Supervised", "#34c759"))
     if legend_entries:
         try:
@@ -426,14 +458,23 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
-    st.set_page_config(page_title="WP5 Sup-Masks 3D Viewer", layout="wide")
-    st.title("WP5 Supervision Masks — 3D Viewer (PyVista)")
+    st.set_page_config(page_title="WP5 Sup-Masks + SV Fill Viewer", layout="wide")
+    st.title("WP5 Supervision Masks + Supervoxel Fill — Viewer")
 
     # Sidebar: config (lock sup_masks directory to a fixed path)
     st.sidebar.header("Configuration")
     SUP_DIR_DEFAULT = Path("/home/peisheng/MONAI/runs/sup_masks_0p1pct_global_d0_5_nov")
     sup_dir = SUP_DIR_DEFAULT if SUP_DIR_DEFAULT.exists() else None
     st.sidebar.info(f"sup_masks directory (locked): {SUP_DIR_DEFAULT}")
+
+    SV_DIR_DEFAULT = Path("/home/peisheng/MONAI/runs/sv_fill_0p1pct")
+    sv_dir = SV_DIR_DEFAULT if SV_DIR_DEFAULT.exists() else None
+    st.sidebar.info(f"SV fill A directory (locked): {SV_DIR_DEFAULT}")
+
+    # New: comparison directory (B) for the 10k run
+    SV_DIR_DEFAULT_B = Path("/home/peisheng/MONAI/runs/sv_fill_0p1pct_n10k")
+    sv_dir_b = SV_DIR_DEFAULT_B if SV_DIR_DEFAULT_B.exists() else None
+    st.sidebar.info(f"SV fill B directory (locked): {SV_DIR_DEFAULT_B}")
     sup_info = {}
     if sup_dir is not None and (sup_dir / "sup_masks_config.json").exists():
         try:
@@ -531,47 +572,456 @@ def main():
         stats = _cached_json_load(str(sj))
 
     with col_l:
-        if img is None or lbl is None:
-            st.warning("Image/Label not found. Provide a valid data_root or datalist.")
-        # Build a unique key so Streamlit replaces the 3D widget when controls change
-        scene_key = (
-            f"pv_scene|cv={'-'.join(map(str,sorted(class_vis)))}|vol={int(show_volume)}|lab={int(show_labels)}|sup={int(show_sup)}|seeds={int(show_seeds)}|ds={int(ds_surfaces)}|dec={decimate:.2f}"
-        )
-        legend_entries = _render_scene(
-            image=img,
-            label=lbl,
-            seed_mask=seed_np,
-            sup_mask=sup_np,
-            show_volume=show_volume,
-            show_labels=show_labels,
-            show_sup=show_sup,
-            show_unlabeled=show_unlabeled,
-            unlabeled_max_points=int(unlabeled_max_points),
-            show_seeds=show_seeds,
-            class_vis=class_vis,
-            vol_opacity=vol_opacity,
-            sup_opacity=sup_opacity,
-            decimate=decimate,
-            ds_surfaces=int(ds_surfaces),
-            scene_key=scene_key,
-        )
-        # Always show full legend mapping for clarity
-        st.subheader("Legend")
-        legend_full = [
-            ("Class 0 (bg)", "#b0b0b0"),
-            ("Class 1", "#ff3b30"),
-            ("Class 2", "#ff9500"),
-            ("Class 3", "#007aff"),
-            ("Class 4", "#5856d6"),
-            ("Supervised", "#34c759"),
-        ]
-        for label_txt, color in legend_full:
-            st.markdown(
-                f"<div style='display:flex;align-items:center;gap:8px;'>"
-                f"<div style='width:14px;height:14px;background:{color};border:1px solid #666;'></div>"
-                f"<span>{label_txt}</span></div>",
-                unsafe_allow_html=True,
+        tab1, tab2, tab3 = st.tabs(["Sup/Seeds 3D", "SV Fill 3D + SV IDs 2D", "SV Compare (A vs B)"])
+
+        with tab1:
+            if img is None or lbl is None:
+                st.warning("Image/Label not found. Provide a valid data_root or datalist.")
+            scene_key = (
+                f"pv_scene|cv={'-'.join(map(str,sorted(class_vis)))}|vol={int(show_volume)}|lab={int(show_labels)}|sup={int(show_sup)}|seeds={int(show_seeds)}|ds={int(ds_surfaces)}|dec={decimate:.2f}"
             )
+            _ = _render_scene(
+                image=img,
+                label=lbl,
+                seed_mask=seed_np,
+                sup_mask=sup_np,
+                show_volume=show_volume,
+                show_labels=show_labels,
+                show_sup=show_sup,
+                show_unlabeled=show_unlabeled,
+                unlabeled_max_points=int(unlabeled_max_points),
+                show_seeds=show_seeds,
+                class_vis=class_vis,
+                vol_opacity=vol_opacity,
+                sup_opacity=sup_opacity,
+                decimate=decimate,
+                ds_surfaces=int(ds_surfaces),
+                scene_key=scene_key,
+            )
+            st.subheader("Legend")
+            legend_full = [
+                ("Class 0 (bg)", "#b0b0b0"),
+                ("Class 1", "#e41a1c"),
+                ("Class 2", "#ff7f00"),
+                ("Class 3", "#4daf4a"),
+                ("Class 4", "#377eb8"),
+                ("Supervised", "#34c759"),
+            ]
+            for label_txt, color in legend_full:
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:8px;'>"
+                    f"<div style='width:14px;height:14px;background:{color};border:1px solid #666;'></div>"
+                    f"<span>{label_txt}</span></div>",
+                    unsafe_allow_html=True,
+                )
+
+        with tab2:
+            st.write("Supervoxel fill visualization (separate plot; not overlaid).")
+            # Controls specific to SV plot
+            col_sv1, col_sv2 = st.columns([1, 2])
+            with col_sv1:
+                sv_classes = st.multiselect("SV classes", options=[0, 1, 2, 3, 4], default=[1, 2, 3, 4], key="sv_class_sel")
+                sv_show_volume = st.checkbox("Show image volume (SV)", value=False, key="sv_show_vol")
+                sv_vol_opacity = st.slider("Volume opacity (SV)", 0.0, 1.0, 0.10, 0.05, key="sv_vol_opac")
+                sv_decimate = st.slider("Surface decimation (SV)", 0.0, 0.9, 0.6, 0.05, key="sv_dec")
+                sv_ds = st.slider("Surface downsample (SV)", 1, 4, 3, 1, key="sv_ds")
+                sv_show_unlabeled = st.checkbox("Show unlabeled points (SV)", value=False, key="sv_unlab")
+                sv_unlabeled_pts = st.slider("Unlabeled sample (SV)", 1000, 200000, 10000, 1000, key="sv_unlab_pts")
+
+            # Load SV fill arrays
+            sv_labels_np: Optional[np.ndarray] = None
+            sv_ids_np: Optional[np.ndarray] = None
+            if sv_dir is not None:
+                sv_lab_p = sv_dir / f"{sel_id}_labels.npy"
+                sv_ids_p = sv_dir / f"{sel_id}_sv_ids.npy"
+                if sv_lab_p.exists():
+                    try:
+                        sv_labels_np = _cached_np_load(str(sv_lab_p))
+                    except Exception:
+                        sv_labels_np = None
+                if sv_ids_p.exists():
+                    try:
+                        sv_ids_np = _cached_np_load(str(sv_ids_p))
+                    except Exception:
+                        sv_ids_np = None
+            else:
+                st.warning("SV fill directory not found or empty.")
+
+            with col_sv2:
+                # 3D plot of dense SV labels as class surfaces
+                if sv_labels_np is None:
+                    st.warning("No SV dense labels found for this case.")
+                else:
+                    # Ensure label shape is (1,X,Y,Z) or (X,Y,Z)
+                    sv_label_arg = sv_labels_np
+                    if sv_label_arg.ndim == 3:
+                        pass
+                    elif sv_label_arg.ndim == 4 and sv_label_arg.shape[0] == 1:
+                        sv_label_arg = sv_label_arg[0]
+                    # Build a key
+                    sv_scene_key = (
+                        f"pv_sv|cv={'-'.join(map(str,sorted(sv_classes)))}|vol={int(sv_show_volume)}|ds={int(sv_ds)}|dec={sv_decimate:.2f}"
+                    )
+                    _render_scene(
+                        image=img if sv_show_volume else None,
+                        label=sv_label_arg,
+                        seed_mask=None,
+                        sup_mask=None,
+                        show_volume=sv_show_volume,
+                        show_labels=True,
+                        show_sup=False,
+                        show_unlabeled=sv_show_unlabeled,
+                        unlabeled_max_points=int(sv_unlabeled_pts),
+                        show_seeds=False,
+                        class_vis=sv_classes,
+                        vol_opacity=sv_vol_opacity,
+                        sup_opacity=0.0,
+                        decimate=sv_decimate,
+                        ds_surfaces=int(sv_ds),
+                        scene_key=sv_scene_key,
+                    )
+
+                # Always show legend for all classes in SV Fill tab
+                st.subheader("Legend (SV Fill)")
+                legend_full_sv = [
+                    ("Class 0 (bg)", "#b0b0b0"),
+                    ("Class 1", "#e41a1c"),
+                    ("Class 2", "#ff7f00"),
+                    ("Class 3", "#4daf4a"),
+                    ("Class 4", "#377eb8"),
+                ]
+                for label_txt, color in legend_full_sv:
+                    st.markdown(
+                        f"<div style='display:flex;align-items:center;gap:8px;'>"
+                        f"<div style='width:14px;height:14px;background:{color};border:1px solid #666;'></div>"
+                        f"<span>{label_txt}</span></div>",
+                        unsafe_allow_html=True,
+                    )
+
+                # 2D slice viewer for supervoxel IDs
+                st.subheader("SV IDs slice (2D)")
+                if sv_ids_np is None:
+                    st.caption("No *_sv_ids.npy found for this case.")
+                else:
+                    if sv_ids_np.ndim != 3:
+                        st.warning(f"Unexpected SV id shape: {sv_ids_np.shape}")
+                    else:
+                        ax = st.selectbox("Axis", options=[0, 1, 2], index=0, help="0=Z, 1=Y, 2=X")
+                        max_idx = sv_ids_np.shape[ax] - 1
+                        idx = st.slider("Slice index", 0, max_idx, max_idx // 2)
+                        if ax == 0:
+                            sl = sv_ids_np[idx, :, :]
+                        elif ax == 1:
+                            sl = sv_ids_np[:, idx, :]
+                        else:
+                            sl = sv_ids_np[:, :, idx]
+                        rgb = _colorize_sv_ids(sl, seed=0)
+                        st.image(rgb, clamp=False, caption=f"SV IDs axis={ax} slice={idx}")
+
+        with tab3:
+            st.write("Compare two SV fill runs side-by-side: A vs B")
+            if sv_dir is None:
+                st.warning("SV fill A directory not found or empty.")
+            if sv_dir_b is None:
+                st.warning("SV fill B directory not found or empty.")
+
+            # Show resolved directory roots for clarity
+            st.caption(f"A dir: {SV_DIR_DEFAULT}")
+            st.caption(f"B dir: {SV_DIR_DEFAULT_B}")
+
+            # Controls for comparison rendering
+            col_cmp_ctrl, col_cmp_blank = st.columns([1, 2])
+            with col_cmp_ctrl:
+                cmp_classes = st.multiselect("Classes (compare)", options=[0, 1, 2, 3, 4], default=[1, 2, 3, 4], key="cmp_class_sel")
+                cmp_show_volume = st.checkbox("Show image volume", value=False, key="cmp_show_vol")
+                cmp_vol_opacity = st.slider("Volume opacity", 0.0, 1.0, 0.10, 0.05, key="cmp_vol_opac")
+                cmp_decimate = st.slider("Surface decimation", 0.0, 0.9, 0.6, 0.05, key="cmp_dec")
+                cmp_ds = st.slider("Surface downsample", 1, 4, 3, 1, key="cmp_ds")
+                cmp_show_seeds = st.checkbox("Show seed points", value=True, key="cmp_show_seeds")
+                cmp_show_unlabeled = st.checkbox("Show unlabeled points", value=False, key="cmp_unlab")
+                cmp_unlabeled_pts = st.slider("Unlabeled sample (points)", 1000, 200000, 10000, 1000, key="cmp_unlab_pts")
+
+            # Load A/B labels and ids
+            A_labels_np = None
+            B_labels_np = None
+            A_ids_np = None
+            B_ids_np = None
+            A_meta = {}
+            B_meta = {}
+            if sv_dir is not None:
+                Ap_lab = sv_dir / f"{sel_id}_labels.npy"
+                Ap_ids = sv_dir / f"{sel_id}_sv_ids.npy"
+                Ap_meta = sv_dir / f"{sel_id}_sv_meta.json"
+                if Ap_lab.exists():
+                    try:
+                        A_labels_np = _cached_np_load(str(Ap_lab))
+                    except Exception:
+                        A_labels_np = None
+                if Ap_ids.exists():
+                    try:
+                        A_ids_np = _cached_np_load(str(Ap_ids))
+                    except Exception:
+                        A_ids_np = None
+                if Ap_meta.exists():
+                    A_meta = _cached_json_load(str(Ap_meta))
+            if sv_dir_b is not None:
+                Bp_lab = sv_dir_b / f"{sel_id}_labels.npy"
+                Bp_ids = sv_dir_b / f"{sel_id}_sv_ids.npy"
+                Bp_meta = sv_dir_b / f"{sel_id}_sv_meta.json"
+                if Bp_lab.exists():
+                    try:
+                        B_labels_np = _cached_np_load(str(Bp_lab))
+                    except Exception:
+                        B_labels_np = None
+                if Bp_ids.exists():
+                    try:
+                        B_ids_np = _cached_np_load(str(Bp_ids))
+                    except Exception:
+                        B_ids_np = None
+                if Bp_meta.exists():
+                    B_meta = _cached_json_load(str(Bp_meta))
+
+            # Show resolved file paths for this case
+            st.caption(f"A labels: {Ap_lab if sv_dir is not None else 'N/A'}")
+            st.caption(f"B labels: {Bp_lab if sv_dir_b is not None else 'N/A'}")
+            st.caption(f"A ids: {Ap_ids if sv_dir is not None else 'N/A'}")
+            st.caption(f"B ids: {Bp_ids if sv_dir_b is not None else 'N/A'}")
+
+            # Normalize shapes to 3D if possible
+            def _to_3d(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                if arr is None:
+                    return None
+                if arr.ndim == 4 and arr.shape[0] == 1:
+                    return arr[0]
+                if arr.ndim == 3:
+                    return arr
+                return None
+
+            A_lbl3 = _to_3d(A_labels_np)
+            B_lbl3 = _to_3d(B_labels_np)
+
+            # Present classes readout (A/B) with counts for classes 0..4
+            def class_counts(arr: Optional[np.ndarray]) -> dict:
+                out = {}
+                if arr is None:
+                    return out
+                try:
+                    vals, cnts = np.unique(arr, return_counts=True)
+                    for v, c in zip(vals.tolist(), cnts.tolist()):
+                        if v in (0, 1, 2, 3, 4):
+                            out[int(v)] = int(c)
+                except Exception:
+                    pass
+                return out
+
+            cols_pc = st.columns(2)
+            with cols_pc[0]:
+                st.markdown("**Present classes (A)**")
+                st.write(class_counts(A_lbl3))
+            with cols_pc[1]:
+                st.markdown("**Present classes (B)**")
+                st.write(class_counts(B_lbl3))
+
+            # Prepare seed masks for A/B (only if shapes match to avoid broadcasting errors)
+            def _shape3(arr: Optional[np.ndarray]) -> Optional[tuple]:
+                if arr is None:
+                    return None
+                if arr.ndim == 4 and arr.shape[0] == 1:
+                    return tuple(arr.shape[1:4])
+                if arr.ndim == 3:
+                    return tuple(arr.shape)
+                return None
+
+            def _reorder3(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+                if arr is None:
+                    return None
+                a = arr
+                if a.ndim == 4 and a.shape[0] == 1:
+                    a = a[0]
+                return a if a.ndim == 3 else None
+
+            seed_for_A = _reorder3(seed_np)
+            seed_for_B = _reorder3(seed_np)
+            if _shape3(seed_for_A) != _shape3(A_lbl3):
+                seed_for_A = None
+            if _shape3(seed_for_B) != _shape3(B_lbl3):
+                seed_for_B = None
+
+            # 3D: three separate plots (Seeds | SV A | SV B)
+            c3dS, c3dA, c3dB = st.columns(3)
+            with c3dS:
+                st.markdown("**Seeds**")
+                keyS = (
+                    f"pv_cmpSeeds|cv={'-'.join(map(str,sorted(cmp_classes)))}|vol={int(cmp_show_volume)}|ds={int(cmp_ds)}"
+                )
+                _render_scene(
+                    image=img if cmp_show_volume else None,
+                    label=lbl,  # color seeds by GT labels
+                    seed_mask=seed_np if cmp_show_seeds else None,
+                    sup_mask=None,
+                    show_volume=cmp_show_volume,
+                    show_labels=False,
+                    show_sup=False,
+                    show_unlabeled=False,
+                    unlabeled_max_points=0,
+                    show_seeds=cmp_show_seeds and (seed_np is not None),
+                    class_vis=cmp_classes,
+                    vol_opacity=cmp_vol_opacity,
+                    sup_opacity=0.0,
+                    decimate=cmp_decimate,
+                    ds_surfaces=int(cmp_ds),
+                    scene_key=keyS,
+                )
+            with c3dA:
+                st.markdown("**A: SV Fill surfaces**")
+                keyA = (
+                    f"pv_cmpA|cv={'-'.join(map(str,sorted(cmp_classes)))}|vol={int(cmp_show_volume)}|ds={int(cmp_ds)}|dec={cmp_decimate:.2f}"
+                )
+                _render_scene(
+                    image=img if cmp_show_volume else None,
+                    label=A_lbl3,
+                    seed_mask=None,
+                    sup_mask=None,
+                    show_volume=cmp_show_volume,
+                    show_labels=True,
+                    show_sup=False,
+                    show_unlabeled=cmp_show_unlabeled,
+                    unlabeled_max_points=int(cmp_unlabeled_pts),
+                    show_seeds=False,
+                    class_vis=cmp_classes,
+                    vol_opacity=cmp_vol_opacity,
+                    sup_opacity=0.35,
+                    decimate=cmp_decimate,
+                    ds_surfaces=int(cmp_ds),
+                    scene_key=keyA,
+                )
+            with c3dB:
+                st.markdown("**B: SV Fill surfaces**")
+                keyB = (
+                    f"pv_cmpB|cv={'-'.join(map(str,sorted(cmp_classes)))}|vol={int(cmp_show_volume)}|ds={int(cmp_ds)}|dec={cmp_decimate:.2f}"
+                )
+                _render_scene(
+                    image=img if cmp_show_volume else None,
+                    label=B_lbl3,
+                    seed_mask=None,
+                    sup_mask=None,
+                    show_volume=cmp_show_volume,
+                    show_labels=True,
+                    show_sup=False,
+                    show_unlabeled=cmp_show_unlabeled,
+                    unlabeled_max_points=int(cmp_unlabeled_pts),
+                    show_seeds=False,
+                    class_vis=cmp_classes,
+                    vol_opacity=cmp_vol_opacity,
+                    sup_opacity=0.35,
+                    decimate=cmp_decimate,
+                    ds_surfaces=int(cmp_ds),
+                    scene_key=keyB,
+                )
+
+            # Legend for compare tab (classes only)
+            st.subheader("Legend (Compare)")
+            legend_compare = [
+                ("Class 0 (bg)", "#b0b0b0"),
+                ("Class 1", "#e41a1c"),
+                ("Class 2", "#ff7f00"),
+                ("Class 3", "#4daf4a"),
+                ("Class 4", "#377eb8"),
+            ]
+            for label_txt, color in legend_compare:
+                st.markdown(
+                    f"<div style='display:flex;align-items:center;gap:8px;'>"
+                    f"<div style='width:14px;height:14px;background:{color};border:1px solid #666;'></div>"
+                    f"<span>{label_txt}</span></div>",
+                    unsafe_allow_html=True,
+                )
+            st.caption("Seeds: rendered as colored points by class when shapes match; otherwise hidden.")
+
+            # 2D: SV IDs slices (A vs B)
+            st.subheader("SV IDs (2D)")
+            ax = st.selectbox("Axis", options=[0, 1, 2], index=0, key="cmp_axis")
+            # Choose max common length for safe slider bounds
+            try:
+                max_idxA = (A_ids_np.shape[ax] - 1) if (A_ids_np is not None and A_ids_np.ndim == 3) else None
+                max_idxB = (B_ids_np.shape[ax] - 1) if (B_ids_np is not None and B_ids_np.ndim == 3) else None
+                max_common = min([x for x in [max_idxA, max_idxB] if x is not None]) if (max_idxA is not None and max_idxB is not None) else (max_idxA or max_idxB or 0)
+            except Exception:
+                max_common = 0
+            idx = st.slider("Slice index", 0, int(max_common), int(max_common // 2) if max_common else 0, key="cmp_idx")
+
+            col2dA, col2dB = st.columns(2)
+            with col2dA:
+                st.markdown("**A SV IDs**")
+                if A_ids_np is not None and A_ids_np.ndim == 3:
+                    if ax == 0:
+                        sl = A_ids_np[idx, :, :]
+                    elif ax == 1:
+                        sl = A_ids_np[:, idx, :]
+                    else:
+                        sl = A_ids_np[:, :, idx]
+                    st.image(_colorize_sv_ids(sl, seed=0), clamp=False)
+                else:
+                    st.caption("A ids missing or wrong shape")
+
+            with col2dB:
+                st.markdown("**B SV IDs**")
+                if B_ids_np is not None and B_ids_np.ndim == 3:
+                    if ax == 0:
+                        sl = B_ids_np[idx, :, :]
+                    elif ax == 1:
+                        sl = B_ids_np[:, idx, :]
+                    else:
+                        sl = B_ids_np[:, :, idx]
+                    st.image(_colorize_sv_ids(sl, seed=1), clamp=False)
+                else:
+                    st.caption("B ids missing or wrong shape")
+
+            # No diff panel per request (A≠B overlay removed to avoid confusion)
+
+            # Debug panel for alignment
+            with st.expander("Debug: shapes & alignment"):
+                try:
+                    gt_shape = tuple(lbl.shape[1:4]) if (lbl is not None and lbl.ndim == 4) else (tuple(lbl.shape) if (lbl is not None and lbl.ndim == 3) else None)
+                except Exception:
+                    gt_shape = None
+                st.write({
+                    "GT_label_shape": gt_shape,
+                    "Seeds_shape": (tuple(seed_np.shape[1:4]) if (seed_np is not None and seed_np.ndim == 4) else (tuple(seed_np.shape) if (seed_np is not None and seed_np.ndim == 3) else None)),
+                    "A_labels_shape": (tuple(A_lbl3.shape) if A_lbl3 is not None else None),
+                    "B_labels_shape": (tuple(B_lbl3.shape) if B_lbl3 is not None else None),
+                    "A_ids_shape": (tuple(A_ids_np.shape) if (A_ids_np is not None and A_ids_np.ndim == 3) else None),
+                    "B_ids_shape": (tuple(B_ids_np.shape) if (B_ids_np is not None and B_ids_np.ndim == 3) else None),
+                })
+
+            # Stats A vs B
+            st.subheader("SV Meta (A vs B)")
+            cols_meta = st.columns(3)
+            with cols_meta[0]:
+                st.markdown("**A**")
+                if A_meta:
+                    st.json(A_meta)
+                else:
+                    st.caption("No meta for A")
+            with cols_meta[1]:
+                st.markdown("**B**")
+                if B_meta:
+                    st.json(B_meta)
+                else:
+                    st.caption("No meta for B")
+            with cols_meta[2]:
+                st.markdown("**Delta (B - A)**")
+                try:
+                    def _get(m, k):
+                        return m.get(k, None) if isinstance(m, dict) else None
+                    delta = {
+                        "n_svs": (int(_get(B_meta, "n_svs")) - int(_get(A_meta, "n_svs"))) if (_get(A_meta, "n_svs") is not None and _get(B_meta, "n_svs") is not None) else None,
+                        "n_filled_svs": (int(_get(B_meta, "n_filled_svs")) - int(_get(A_meta, "n_filled_svs"))) if (_get(A_meta, "n_filled_svs") is not None and _get(B_meta, "n_filled_svs") is not None) else None,
+                        "fill_fraction": (float(_get(B_meta, "fill_fraction")) - float(_get(A_meta, "fill_fraction"))) if (_get(A_meta, "fill_fraction") is not None and _get(B_meta, "fill_fraction") is not None) else None,
+                        "seconds": (float(_get(B_meta, "seconds")) - float(_get(A_meta, "seconds"))) if (_get(A_meta, "seconds") is not None and _get(B_meta, "seconds") is not None) else None,
+                    }
+                    st.json(delta)
+                except Exception:
+                    st.caption("Delta unavailable")
 
     # Stats panel
     st.subheader("Case Stats")

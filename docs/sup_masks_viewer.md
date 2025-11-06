@@ -12,9 +12,11 @@ Install (inside your venv)
 Run
 - venv/bin/python -m streamlit run scripts/vis_sup_masks_streamlit.py -- --data-root /data3/wp5/wp5-code/dataloaders/wp5-dataset --datalist datalist_train.json
 
-Locked sup_masks directory
-- The app reads masks from a fixed folder by default: /home/peisheng/MONAI/runs/sup_masks_0p1pct_global_d0_5_nov
-- To change it, edit SUP_DIR_DEFAULT in scripts/vis_sup_masks_streamlit.py:434
+Locked directories
+- Sup-masks: /home/peisheng/MONAI/runs/sup_masks_0p1pct_global_d0_5_nov
+- SV fill A: /home/peisheng/MONAI/runs/sv_fill_0p1pct
+- SV fill B: /home/peisheng/MONAI/runs/sv_fill_0p1pct_n10k
+- To change these, edit the constants near the top of `main()` in scripts/vis_sup_masks_streamlit.py.
 
 Controls (sidebar)
 - Show image volume: toggle 3D volume (heavy; leave off for speed)
@@ -23,22 +25,19 @@ Controls (sidebar)
 - Show seed points: colored seed voxels per class
 - Show unlabeled (sampled points): gray random sample of unlabeled voxels
 - Classes (0..4): filter which classes to display for surfaces and seeds
-- Surface decimation: 0.0..0.9; higher is faster, fewer polygons
+- Surface decimation: 0.0..0.9; fraction of triangles to remove (see notes below)
 - Surface downsample (stride): 1..4; higher is faster; set 1 for exact overlay with volume
 - Unlabeled sample (points): cap number of unlabeled points drawn
 
-Legend
-- Always shown under the 3D view with colors for:
-  - Class 0 (bg) #b0b0b0
-  - Class 1 #ff3b30
-  - Class 2 #ff9500
-  - Class 3 #007aff
-  - Class 4 #5856d6
-  - Supervised #34c759
+Legends
+- Sup/Seeds tab: classes + supervised region
+- SV Fill tab: classes
+- SV Compare tab: classes; seeds panel uses GT label colors
 
 Performance tips
 - Start with: volume OFF, label surfaces OFF, supervised ON, seeds ON
-- Use decimation 0.6–0.8 and stride 3–4 for quick previews
+- For guaranteed surfaces: set decimation=0.0 and stride=1 (heavier)
+- Typical preview: decimation=0.4–0.6, stride=2–3
 - Reduce unlabeled points to 5k–10k
 - For exact overlay with volume, set stride=1 (heavier)
 
@@ -48,9 +47,24 @@ Troubleshooting
 - Bad X server connection: ensure Xvfb is present, or run on a machine with DISPLAY
 
 Key code references
-- Locked sup dir: scripts/vis_sup_masks_streamlit.py:434
-- 3D embed (stpyvista): scripts/vis_sup_masks_streamlit.py:541
-- Default camera framing: scripts/vis_sup_masks_streamlit.py:251
-- Class colors: scripts/vis_sup_masks_streamlit.py:287
-- Class filtering: scripts/vis_sup_masks_streamlit.py:314, scripts/vis_sup_masks_streamlit.py:333
+- Main app: scripts/vis_sup_masks_streamlit.py
+- 3D embed (stpyvista): scripts/vis_sup_masks_streamlit.py
+- Default camera framing: scripts/vis_sup_masks_streamlit.py
+- Class colors: scripts/vis_sup_masks_streamlit.py
+- Class filtering & surfaces: scripts/vis_sup_masks_streamlit.py
 
+SV Compare tab (A vs B)
+- Three 3D plots: Seeds | A surfaces | B surfaces
+- 2D SV-ID slices: A and B side-by-side
+- Present classes readout: counts for classes 0..4 for A/B
+- Debug expander shows shapes to verify alignment
+- Tips if surfaces are missing:
+  - Ensure selected classes exist in the readout
+  - Set stride=1 and decimation=0.0
+  - Turn off volume overlay to check surfaces alone
+
+Surface decimation details
+- Uses PyVista `decimate_pro` with a reduction fraction (0.0–0.9)
+- 0.0 disables simplification; preserves thin structures
+- Higher values remove more triangles; faster but can erase small parts
+- The app keeps the original mesh if decimation removes too many points
