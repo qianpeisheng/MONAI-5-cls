@@ -255,6 +255,43 @@ json.dump([train[i] for i in few], open('datalist_train_1pct.json','w'), indent=
 - `mednist_tutorial.ipynb` — reference for IO/transform patterns.
 - `WP5_Segmentation_Data_Guide.md` — authoritative WP5 data details, label policy, split.
 
+## Visualization (2D/3D viewers)
+
+We include Streamlit apps to visually inspect GT labels, model predictions, and supervoxel outputs. These assume NIfTI images/labels are canonicalized to RAS (as in training via `Orientationd(axcodes='RAS')`).
+
+Install (one line):
+- Python deps: `pip install streamlit matplotlib scikit-image nibabel pyvista streamlit-pyvista plotly`
+
+Tools
+- GT vs Supervoxel‑Labeled (voted) — side‑by‑side 2D and 3D pair view
+  - Script: `scripts/vis_gt_vs_sv_streamlit.py`
+  - SV input: a folder with `<id>_labels.npy` produced from supervoxel voting, e.g. `/home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted`
+  - Datalist: for case selection; use `datalist_train.json` for the above folder
+  - Launch (with train split): `python3 -m streamlit run scripts/vis_gt_vs_sv_streamlit.py -- --sv-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted --datalist datalist_train.json`
+  - Notes:
+    - 2D overlays use class colors (1 red, 2 green, 3 blue, 4 yellow; 6 gray), with optional mismatch highlight.
+    - 3D offers Matplotlib (static) and PyVista (interactive). PyVista volume/surface axes are aligned to (X,Y,Z); spacing uses NIfTI affine norms (dx,dy,dz).
+    - Metrics shown per case: Dice and IoU for classes 0..4, ignoring label 6.
+
+- Fixed eval comparisons (legacy) — GT vs up to 4 prediction folders
+  - Script: `scripts/vis_wp5_streamlit.py`
+  - Launch: `python3 -m streamlit run scripts/vis_wp5_streamlit.py`
+  - Configure the fixed `RUNS` mapping inside the script to your prediction folders.
+
+- Supervoxel ID viewer — inspect unlabeled `sv_ids` and optional fully labeled SV volumes
+  - Script: `scripts/vis_sv_ids_streamlit.py`
+  - Launch (example): `python3 -m streamlit run scripts/vis_sv_ids_streamlit.py -- --sv-dir /home/peisheng/MONAI/runs/sv_fill_5k_nofill_ras2 --data-root /data3/wp5/wp5-code/dataloaders/wp5-dataset --datalist datalist_train.json`
+  - Features: 3D boundary meshes by ID, sampled SV surfaces, and 2D colorized ID slices.
+
+Split matching and paths
+- The folder `/home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted` contains voted voxel labels for the train split (≈380). Use `datalist_train.json` to see all cases.
+- If you use `datalist_test.json`, ensure you have a corresponding voted folder for the test cases; otherwise no overlap will be listed.
+
+Troubleshooting
+- “No cases match SV‑labeled availability”: switch to `datalist_train.json` or point the app to a matching voted folder.
+- PyVista/Matplotlib mismatch: the PyVista grid now uses dimensions `(X+1,Y+1,Z+1)` and spacing `(dx,dy,dz)` to match Matplotlib’s (X,Y,Z) meshing.
+- Empty surfaces: try lowering decimation, disabling volume overlay, and reducing 3D downsample to 1.
+
 ## Evaluation & Metrics (official)
 - Use `scripts/eval_wp5.py` for all evaluations. In‑script trainer evaluation has been removed.
 - Classes to evaluate: 0–4 (background included), ignore voxels with label 6.
