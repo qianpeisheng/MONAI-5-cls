@@ -292,6 +292,22 @@ Troubleshooting
 - PyVista/Matplotlib mismatch: the PyVista grid now uses dimensions `(X+1,Y+1,Z+1)` and spacing `(dx,dy,dz)` to match Matplotlib’s (X,Y,Z) meshing.
 - Empty surfaces: try lowering decimation, disabling volume overlay, and reducing 3D downsample to 1.
 
+## Supervoxel Voted Label Evaluation
+- Script: `scripts/eval_sv_voted_wp5.py`
+- Purpose: evaluate per-voxel supervoxel-voted labels (`<id>_labels.npy`) against GT with WP5 policies, and compute voting diagnostics.
+- Inputs:
+  - `--sv-dir`: folder with `<id>_labels.npy` (e.g., `/home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted`).
+  - `--sv-ids-dir`: folder with `<id>_sv_ids.npy` to enable entropy/purity diagnostics (e.g., `/home/peisheng/MONAI/runs/sv_fullgt_5k_ras2`).
+  - `--datalist`: `datalist_train.json` (train split recommended for this folder).
+  - Policy: evaluate classes 0..4; ignore voxels with `gt==6`; both‑empty=1.0; optional HD95 with `--heavy --hd_percentile 95`.
+- Parallel run (train split):
+  - `python3 scripts/eval_sv_voted_wp5.py --sv-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted --sv-ids-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2 --datalist datalist_train.json --output_dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted_eval --ignore-class 6 --num_workers 8 --progress --log_to_file`
+- Outputs:
+  - `metrics/per_case.csv` — per-case Dice/IoU (and optional HD/ASD) for classes 0..4 + voxel accuracy.
+  - `metrics/summary.json` — dataset averages and (if `--sv-ids-dir` provided) SV diagnostics: mean and voxel‑weighted mean normalized entropy, purity, and entropy fractions at 0.3/0.5.
+  - `eval.log` — tee of stdout/stderr inside the eval folder.
+  - Console also prints the dataset‑level entropy means after Dice/IoU.
+
 ## Evaluation & Metrics (official)
 - Use `scripts/eval_wp5.py` for all evaluations. In‑script trainer evaluation has been removed.
 - Classes to evaluate: 0–4 (background included), ignore voxels with label 6.
