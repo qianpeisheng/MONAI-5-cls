@@ -113,20 +113,72 @@ def build_datalists(data_dir: Path, cfg_path: Path) -> Tuple[List[Dict], List[Di
 
 
 def override_train_labels(train_list: List[Dict], override_dir: Path) -> List[Dict]:
-    """Override training label paths with files from override_dir mirroring basenames.
+    """Override training label paths with files from override_dir.
+
+    Supports supervoxel-voted labels or any alternative label source.
+    Maps case IDs to override files, handling naming differences:
+    - GT format: <case_id>_label.nii
+    - SV format: <case_id>_labels.npy (note: plural 'labels' + .npy extension)
 
     Keeps 'image' unchanged. Only adjusts 'label' for training records.
+    Validates that override files exist.
+
+    Args:
+        train_list: Original training data list with GT label paths
+        override_dir: Directory containing override label files
+
+    Returns:
+        Updated data list with overridden label paths
+
+    Raises:
+        FileNotFoundError: If override files are missing
     """
     out: List[Dict] = []
+    missing_files = []
+
     for rec in train_list:
         lbl_path = Path(rec["label"]) if rec.get("label") else None
         if lbl_path is None:
             out.append(rec)
             continue
-        new_lbl = override_dir / lbl_path.name
+
+        # Use 'id' field for robust matching
+        case_id = rec.get("id")
+        if not case_id:
+            # Fallback: extract from label path (remove _label.nii suffix)
+            case_id = lbl_path.stem.replace("_label", "")
+
+        # Try common naming patterns for override files
+        # Pattern 1: <case_id>_labels.npy (supervoxel voted labels)
+        # Pattern 2: <case_id>_label.nii (GT-like format)
+        # Pattern 3: exact basename match
+        candidates = [
+            override_dir / f"{case_id}_labels.npy",
+            override_dir / f"{case_id}_label.nii",
+            override_dir / lbl_path.name,
+        ]
+
+        new_lbl = None
+        for candidate in candidates:
+            if candidate.exists():
+                new_lbl = candidate
+                break
+
+        if new_lbl is None:
+            missing_files.append(f"{case_id} (tried: {', '.join([c.name for c in candidates])})")
+            continue
+
         r = dict(rec)
         r["label"] = str(new_lbl)
         out.append(r)
+
+    if missing_files:
+        raise FileNotFoundError(
+            f"Override label files not found for {len(missing_files)} cases:\n" +
+            "\n".join(missing_files[:5]) +
+            (f"\n... and {len(missing_files)-5} more" if len(missing_files) > 5 else "")
+        )
+
     return out
 
 
@@ -1590,6 +1642,18 @@ def train(args):
     train_list, test_list = build_datalists(data_root / "data", split_cfg)
     train_list = subset_datalist(train_list, args.subset_ratio, args.seed)
 
+    # Override train labels if requested (e.g., use supervoxel-voted labels instead of GT)
+    if args.train_label_override_dir:
+        override_dir = Path(args.train_label_override_dir)
+        print(f"\n{'='*60}")
+        print(f"LABEL OVERRIDE ENABLED")
+        print(f"{'='*60}")
+        print(f"Overriding {len(train_list)} training labels from:")
+        print(f"  {override_dir}")
+        train_list = override_train_labels(train_list, override_dir)
+        print(f"✓ Successfully mapped all {len(train_list)} cases to override labels")
+        print(f"{'='*60}\n")
+
     # Transforms and datasets
     # Where to save/load static supervision masks
     if getattr(args, "sup_masks_dir", ""):
@@ -2025,7 +2089,9 @@ def parse_args(argv: List[str] | None = None):
         "--train_label_override_dir",
         type=str,
         default="",
-        help="Override training label paths with files from this directory (mirror basenames)",
+        help="[Optional] Override training labels with alternative labels (e.g., supervoxel-voted labels). "
+             "Supports .npy and .nii formats. If not specified, uses original GT labels. "
+             "Example: /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted",
     )
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch_size", type=int, default=2)

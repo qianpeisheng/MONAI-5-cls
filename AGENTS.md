@@ -251,6 +251,156 @@ json.dump([train[i] for i in few], open('datalist_train_1pct.json','w'), indent=
 - Memory: 3D transformers need larger GPUs; reduce patch size or use UNet/DynUNet if constrained.
 - Spacing: NIfTI headers often are 1.0mm; re-spacing not required unless you want standardization.
 
+## Training with Supervoxel-Voted Labels
+
+You can train segmentation models using supervoxel-voted labels instead of original ground truth labels. This is useful for:
+- Training with pseudo-labels generated from supervoxel voting
+- Exploring the upper bound of supervoxel-based segmentation quality
+- Creating baseline comparisons for weakly-supervised approaches
+
+### How It Works
+
+The training script (`train_finetune_wp5.py`) supports an **optional** `--train_label_override_dir` flag that replaces GT labels with alternative labels (e.g., supervoxel-voted labels).
+
+**IMPORTANT**: This is completely optional. If you don't specify this flag, training uses the original GT labels as normal.
+
+### Label Format Requirements
+
+Override labels can be in either format:
+- **`.npy` format** (NumPy arrays) - e.g., supervoxel-voted labels: `<case_id>_labels.npy`
+- **`.nii` format** (NIfTI) - e.g., GT-like format: `<case_id>_label.nii`
+
+MONAI's `LoadImaged` transform automatically handles both formats. No conversion is needed.
+
+**Technical details**:
+- Override labels must match original GT dimensions exactly
+- Values should be in the same range as GT (0-4 for WP5)
+- Orientation should be RAS (same as training pipeline)
+- The override function matches cases using the `"id"` field from datalist
+
+### Usage Example
+
+Using the best supervoxel configuration from parameter sweep (slic mode, 20k segments):
+
+```bash
+# Activate environment
+. /home/peisheng/MONAI/venv/bin/activate
+
+# Train with supervoxel-voted labels (fully supervised with SV labels)
+python3 train_finetune_wp5.py \
+  --mode train \
+  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
+  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+  --train_label_override_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted \
+  --output_dir runs/train_sv_best_slic_n20000 \
+  --epochs 20 \
+  --batch_size 2 \
+  --num_workers 4 \
+  --init scratch \
+  --net basicunet \
+  --norm clip_zscore \
+  --roi_x 112 --roi_y 112 --roi_z 80 \
+  --log_to_file
+```
+
+**Without the flag** (standard GT training):
+```bash
+# Same command but WITHOUT --train_label_override_dir uses original GT labels
+python3 train_finetune_wp5.py \
+  --mode train \
+  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
+  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+  --output_dir runs/train_baseline_gt \
+  --epochs 20 \
+  --batch_size 2 \
+  --num_workers 4 \
+  --init scratch \
+  --net basicunet
+```
+
+### Available Supervoxel Label Directories
+
+From the parameter sweep (see `runs/sv_sweep_ras2_summary.md` for full results):
+- **Best overall**: `/data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted` (Dice: 0.9149)
+- **Balanced**: `/data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted` (Dice: 0.9089)
+- **Legacy 5k**: `/home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted` (documented earlier)
+
+All contain 380 train cases with voted labels in `.npy` format.
+
+### Validation
+
+The script validates that:
+1. All training cases have corresponding override label files
+2. Files exist at the expected paths (handles naming variations automatically)
+3. If any files are missing, training aborts with a clear error message
+
+You'll see confirmation output when override is active:
+```
+============================================================
+LABEL OVERRIDE ENABLED
+============================================================
+Overriding 380 training labels from:
+  /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted
+✓ Successfully mapped all 380 cases to override labels
+============================================================
+```
+
+### Key Difference from GT Training
+
+| Aspect | GT Training (default) | SV Override Training |
+|--------|----------------------|---------------------|
+| **Label source** | Original manual annotations | Supervoxel-voted labels |
+| **Label path** | `<case_id>_label.nii` | `<case_id>_labels.npy` |
+| **Label quality** | Ground truth | Pseudo-labels (noisy) |
+| **Command flag** | (none, default behavior) | `--train_label_override_dir <path>` |
+| **Use case** | Standard supervised learning | Upper bound for SV quality, baseline comparisons |
+
+### Batch Training with All SV Configurations
+
+To train models using all 30 supervoxel configurations from the parameter sweep (distributed across 2 GPUs):
+
+```bash
+# Activate environment
+. /home/peisheng/MONAI/venv/bin/activate
+
+# Run all 30 training jobs (15 per GPU, sequential within each GPU)
+bash scripts/train_all_sv_configs.sh
+
+# Optional: Preview commands without executing
+bash scripts/train_all_sv_configs.sh --dry-run
+
+# Optional: Resume training (skip already completed runs)
+bash scripts/train_all_sv_configs.sh --resume
+```
+
+**What it does:**
+- Finds all 30 SV configurations in `/data3/wp5/monai-sv-sweeps/`
+- Splits jobs: 15 on GPU 0, 15 on GPU 1
+- Runs sequentially within each GPU (parallel across GPUs)
+- Each run trains for 20 epochs with batch_size=2
+- Saves to unique directories: `runs/train_sv_<config>_e20/`
+- Each run logs to its own `train.log` file
+
+**Estimated time:** ~15-20 hours per GPU (depends on hardware)
+
+**Output structure:**
+```
+runs/
+├── train_sv_slic_n2000_c0.05_s1.0_e20/
+├── train_sv_slic_n4000_c0.05_s1.0_e20/
+├── train_sv_slic-grad-mag_n2000_c0.05_s1.0_e20/
+└── ... (30 total directories)
+```
+
+**To monitor progress:**
+```bash
+# Watch GPU 0 jobs
+tail -f runs/train_sv_slic_n*_e20/train.log
+
+# Check how many completed
+ls -d runs/train_sv_*_e20/ | wc -l
+```
+
 ## Where to look in this repo
 - `mednist_tutorial.ipynb` — reference for IO/transform patterns.
 - `WP5_Segmentation_Data_Guide.md` — authoritative WP5 data details, label policy, split.
