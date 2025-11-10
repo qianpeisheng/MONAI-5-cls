@@ -478,43 +478,51 @@ Masking/selection notes
 - Convert predictions to 5 classes (0..4) via argmax on `out[:, :5]` if your head has >5 channels.
 - Clamp ground truth to 0..4 for IoU/Dice; for HD/ASD compute per‑class on binarized masks; mask out voxels where `gt==6`.
 
-Baselines (as provided) — evaluate over classes 0..4, ignore class 6
+Baselines (corrected from actual experiments) — evaluate over classes 0..4, ignore class 6
 
-100% (full fine‑tune)
+**Source paths:**
+- 100% GT: `runs/grid_clip_zscore/scratch_subset_100/eval_20251021-120429/metrics/summary.json`
+- 10% GT: `runs/fewshot_grid_clip_zscore/points_10_d1_proportional/metrics/summary.json`
+- 1% GT: `runs/fp_1pct_global_d0_20251021-153502/metrics/summary.json`
 
-| Class | Dice | IoU | HD | ASD |
+100% (full fine‑tune from scratch)
+
+| Class | Dice | IoU | HD95 | ASD |
 |---:|---:|---:|---:|---:|
-| 0 | 0.98275321 | 0.96620361 | 1.24574252 | 0.27684943 |
-| 1 | 0.78495372 | 0.70042153 | 10.54281509 | 4.32888065 |
-| 2 | 0.90701377 | 0.83129394 | 3.85318096 | 1.34848441 |
-| 3 | 0.82481699 | 0.78822708 | 1.42007550 | 0.36657448 |
-| 4 | 0.56270956 | 0.45448813 | 20.66707425 | 7.81830500 |
-| average | 0.81244945 | 0.74812686 | 7.54577767 | 2.82781879 |
+| 0 | 0.9875 | 0.9754 | 1.6118 | 0.2869 |
+| 1 | 0.8656 | 0.8038 | 17.4005 | 2.7269 |
+| 2 | 0.9148 | 0.8484 | 6.4946 | 1.3603 |
+| 3 | 0.8440 | 0.7989 | 1.1987 | 0.3054 |
+| 4 | 0.7471 | 0.6548 | 7.4858 | 2.6580 |
+| **average** | **0.8718** | **0.8163** | **6.8383** | **1.4675** |
 
-10% (few‑shot baseline)
+10% GT (few‑shot, proportional sampling)
 
-| Class | Dice | IoU | HD | ASD |
-|---:|---:|---:|---:|---:|
-| 0 | 0.84598023 | 0.73461127 | 14.91666670 | 0.00387064 |
-| 1 | 0 | 0 | 0 | 0 |
-| 2 | 0 | 0 | 0 | 0 |
-| 3 | 0.6 | 0.6 | 0 | 0 |
-| 4 | 0 | 0 | 0 | 0 |
-| average | 0.28919605 | 0.26692826 | 2.98333333 | 0.00077413 |
+| Class | Dice | IoU |
+|---:|---:|---:|
+| 0 | 0.9943 | 0.9887 |
+| 1 | 0.8760 | 0.8208 |
+| 2 | 0.9163 | 0.8517 |
+| 3 | 0.7935 | 0.7478 |
+| 4 | 0.7759 | 0.6878 |
+| **average** | **0.8712** | **0.8193** |
 
-1% (few‑shot baseline)
+1% GT (few‑shot, global sampling, no dilation)
 
-| Class | Dice | IoU | HD | ASD |
-|---:|---:|---:|---:|---:|
-| 0 | 0.24273103 | 0.16986430 | 45.86634000 | 1.16762257 |
-| 1 | 0.18725551 | 0.10789209 | 44.13901038 | 25.32536418 |
-| 2 | 0 | 0 | 0 | 0 |
-| 3 | 0.6 | 0.6 | 0 | 0 |
-| 4 | 0 | 0 | 0 | 0 |
-| average | 0.20599731 | 0.17555128 | 18.00107008 | 5.29859735 |
+| Class | Dice | IoU |
+|---:|---:|---:|
+| 0 | 0.9824 | 0.9656 |
+| 1 | 0.8571 | 0.7886 |
+| 2 | 0.9036 | 0.8291 |
+| 3 | 0.6642 | 0.6184 |
+| 4 | 0.7475 | 0.6446 |
+| **average** | **0.8310** | **0.7693** |
 
 Replicating baselines
-- Use the same split (train=380, test=180), same class policy (0..4 evaluated, 6 ignored), and the same metric definitions. If you suspect HD vs HD95 discrepancy, set HD percentile=100 to match these values. Both‑empty=1.0 policy is always applied.
+- Use the same split (train=380, test=180), same class policy (0..4 evaluated, 6 ignored), and the same metric definitions
+- The 100% GT baseline uses HD95 (percentile=95.0); 10% and 1% GT do not compute HD/ASD
+- Both‑empty=1.0 policy is always applied
+- The `summarize_sv_training_results.py` script automatically reads these baseline values from the source paths above for accurate comparisons
 
 External precompute (1% points, no dilation)
 - Precompute: `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/precompute_sup_masks.py --mode few_points_global --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --subset_ratio 1.0 --ratio 0.01 --dilate_radius 0 --balance proportional --seed 42 --fp_sample_mode uniform_all --out_dir runs/sup_masks_1pct_uniform_all`
