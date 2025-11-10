@@ -457,38 +457,41 @@ A weakly-supervised approach that combines sparse annotation (0.1% of voxels) wi
 **Recent Fixes** (2025-11-10):
 - Fixed split config parsing to handle `test_serial_numbers` format
 - Added support for `data/` subdirectory in dataset structure
-- All 380 training cases now load correctly
+- Fixed class 0 (background) exclusion bug - now includes all classes
+- All 380 training cases now load correctly with proper class distribution
 
-### End-to-End Pipeline
+### Complete Pipeline (Recommended)
+
+**Single command that runs everything: sampling → propagation → training**
 
 ```bash
-# Activate environment
-. /home/peisheng/MONAI/venv/bin/activate
-
-# Run complete pipeline (sampling + propagation + training directories)
-python3 scripts/pipeline_strategic_sparse_sv.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --k_values 1,3,5,7,10,15,20,25,30,50 --output_dir runs/strategic_sparse_0p1pct_k_multi --seed 42
+bash scripts/run_strategic_sparse_complete.sh
 ```
 
 **What it does**:
-1. Samples ~1,100 seeds per case (0.1% budget) strategically
-2. Assigns labels to ~13-15% of supervoxels (those with seeds)
-3. Propagates to remaining SVs using k-NN for all 10 k values
-4. Creates training directories: `k_variants/k{01,03,05,...}/`
+1. Strategic seed sampling (~1,100 seeds per case, stratified by class)
+2. Multi-k label propagation (k=1,3,5,7,10,15,20,25,30,50)
+3. Parallel training across 2 GPUs for all 10 k variants
+4. Estimated time: 12-20 hours total (pipeline ~3h + training ~10-15h)
 
-**Expected output**:
+**Options**:
+```bash
+# Use custom output directory
+bash scripts/run_strategic_sparse_complete.sh --output_dir runs/my_experiment
+
+# Only run pipeline, skip training
+bash scripts/run_strategic_sparse_complete.sh --skip-training
+
+# Only run training (if pipeline already done)
+bash scripts/run_strategic_sparse_complete.sh --skip-pipeline
+
+# Show help
+bash scripts/run_strategic_sparse_complete.sh --help
 ```
-Processing 380 cases from train split
-Budget: 0.001 (0.10%)
-...
-STEP 1: Strategic Seed Sampling [COMPLETE]
-STEP 2: Multi-k Label Propagation [COMPLETE]
-Pipeline completed successfully!
-Output: runs/strategic_sparse_0p1pct_k_multi
-```
 
-### Step-by-Step (Alternative)
+### Manual Steps (Alternative)
 
-If you prefer to run steps separately:
+If you prefer to run steps separately or need more control:
 
 **Step 1: Strategic Seed Sampling**
 
@@ -517,12 +520,14 @@ python3 scripts/propagate_sv_labels_multi_k.py --sv_dir /data3/wp5/monai-sv-swee
 - `k_variants/k01/<case_id>_labels.npy` - Symlinks for training
 - `propagation_summary.json` - Statistics
 
-### Training on All K Variants (Parallel)
+**Step 3: Training on All K Variants (Parallel)**
+
+**Note**: This step is included in the complete pipeline script above. Only run manually if needed.
 
 Train models for all 10 k values across 2 GPUs:
 
 ```bash
-bash scripts/train_all_k_variants.sh runs/sv_sparse_prop_0p1pct_strategic/k_variants
+bash scripts/train_all_k_variants.sh runs/strategic_sparse_0p1pct_k_multi/k_variants
 ```
 
 **What it does**:

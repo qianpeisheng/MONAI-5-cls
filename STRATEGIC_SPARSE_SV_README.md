@@ -56,68 +56,56 @@ A complete pipeline for training segmentation models with minimal annotations (0
 
 ## Commands to Run Experiments
 
-### 1. End-to-End Pipeline (Recommended)
+### Complete Pipeline (Recommended) - ONE COMMAND
+
+**Run everything: sampling → propagation → training (12-20 hours)**
 
 ```bash
-# Activate environment
-. /home/peisheng/MONAI/venv/bin/activate
+bash scripts/run_strategic_sparse_complete.sh
+```
 
-# Run complete pipeline
+**What it does**:
+1. Strategic seed sampling (~1,100 seeds per case, stratified by class)
+2. Multi-k label propagation (k=1,3,5,7,10,15,20,25,30,50)
+3. Parallel training across 2 GPUs for all 10 k variants
+4. Estimated time: ~3h pipeline + ~10-15h training = 12-20h total
+
+**Options**:
+```bash
+# Custom output directory
+bash scripts/run_strategic_sparse_complete.sh --output_dir runs/my_experiment
+
+# Only run pipeline (skip training)
+bash scripts/run_strategic_sparse_complete.sh --skip-training
+
+# Only run training (pipeline already done)
+bash scripts/run_strategic_sparse_complete.sh --skip-pipeline
+```
+
+### Manual Steps (If Needed)
+
+**Step 1: Pipeline Only (Sampling + Propagation)**
+
+```bash
 python3 scripts/pipeline_strategic_sparse_sv.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --k_values 1,3,5,7,10,15,20,25,30,50 --output_dir runs/strategic_sparse_0p1pct_k_multi --seed 42
 ```
 
-**Expected output**:
-```
-Processing 380 cases from train split
-Budget: 0.001 (0.10%)
-...
-STEP 1: Strategic Seed Sampling [COMPLETE]
-STEP 2: Multi-k Label Propagation [COMPLETE]
-Pipeline completed successfully!
-Output: runs/strategic_sparse_0p1pct_k_multi
-```
-
-### 2. Train All K Variants (Parallel on 2 GPUs)
+**Step 2: Training Only (All K Variants)**
 
 ```bash
 bash scripts/train_all_k_variants.sh runs/strategic_sparse_0p1pct_k_multi/k_variants
 ```
 
-**What it does**:
-- Distributes 10 k values across 2 GPUs (5 per GPU)
-- Sequential execution within each GPU, parallel across GPUs
-- Each run: 20 epochs, batch_size=2, BasicUNet
-- Saves to `runs/train_sv_sparse_k{01,03,05,...}/`
-
-**Monitor progress**:
+**Monitor Training Progress**:
 ```bash
 # Watch GPU 0 jobs
 tail -f runs/train_sv_sparse_k01/train.log
 
-# Check completion (should show 10)
+# Check completion (should show 10 when done)
 ls -d runs/train_sv_sparse_k*/ | wc -l
 
 # See all training runs
 ls -d runs/train_sv_sparse_k*/
-```
-
-### 3. Step-by-Step (Alternative)
-
-If you prefer manual control:
-
-**Step 1: Strategic Seed Sampling**
-```bash
-python3 scripts/sample_strategic_sv_seeds.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --class_weights 1,1,2,2 --output_dir runs/strategic_seeds_0p1pct --seed 42
-```
-
-**Step 2: Multi-k Label Propagation**
-```bash
-python3 scripts/propagate_sv_labels_multi_k.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --seeds_dir runs/strategic_seeds_0p1pct --k_values 1,3,5,7,10,15,20,25,30,50 --output_dir runs/sv_sparse_prop_0p1pct_strategic --seed 42
-```
-
-**Step 3: Train (same as #2)**
-```bash
-bash scripts/train_all_k_variants.sh runs/sv_sparse_prop_0p1pct_strategic/k_variants
 ```
 
 ## Output Directory Structure
