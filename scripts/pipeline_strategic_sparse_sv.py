@@ -3,7 +3,7 @@
 End-to-end pipeline for strategic sparse SV labeling + multi-k propagation.
 
 Orchestrates:
-1. Strategic seed sampling (max 1 per SV, FG borders, rare classes)
+1. Strategic seed sampling (max 1 per SV, stratified by class)
 2. Multi-k label propagation (k-NN weighted voting)
 3. Training directory creation (symlinks)
 
@@ -13,6 +13,7 @@ Usage:
         --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
         --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
         --budget_ratio 0.001 \
+        --class_weights 0.1,1,1,2,2 \
         --k_values 1,3,5,7,10,15,20,25,30,50 \
         --output_dir runs/sv_sparse_prop_0p1pct_strategic \
         --seed 42
@@ -56,8 +57,8 @@ def main():
                        help="Split to process (default: train)")
     parser.add_argument("--budget_ratio", type=float, default=0.001,
                        help="Fraction of voxels to sample (default: 0.001 = 0.1%%)")
-    parser.add_argument("--class_weights", type=str, default="1,1,2,2",
-                       help="Class weights for 1,2,3,4 (default: 1,1,2,2)")
+    parser.add_argument("--class_weights", type=str, default="0.1,1,1,2,2",
+                       help="Class weights for 0,1,2,3,4 (default: 0.1,1,1,2,2)")
     parser.add_argument("--k_values", type=str, default="1,3,5,7,10,15,20,25,30,50",
                        help="Comma-separated k values (default: 1,3,5,7,10,15,20,25,30,50)")
     parser.add_argument("--output_dir", type=str, required=True,
