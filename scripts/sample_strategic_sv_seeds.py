@@ -36,11 +36,44 @@ from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, Orientati
 from tqdm import tqdm
 
 
-def load_split_cases(split_cfg: str, split: str = "train") -> list:
-    """Load case IDs from split config."""
+def load_split_cases(split_cfg: str, data_root: Path, split: str = "train") -> list:
+    """Load case IDs from split config.
+
+    Split config format:
+        {"test_serial_numbers": [9, 12, 15, ...]}
+
+    Train set = all cases except those with serial numbers in test set.
+    """
+    import re
+    import os
+
     with open(split_cfg) as f:
         cfg = json.load(f)
-    return cfg.get(split, [])
+
+    test_serials = set(cfg.get("test_serial_numbers", []))
+
+    def serial_from_name(name: str):
+        """Extract serial number from case name like 'SN13B0_...'"""
+        m = re.match(r"^SN(\d+)", name)
+        return int(m.group(1)) if m else None
+
+    # Find all cases from image files
+    cases = []
+    for name in os.listdir(data_root):
+        if name.endswith("_image.nii"):
+            case_id = name[:-10]  # Remove '_image.nii'
+            serial = serial_from_name(case_id)
+
+            if serial is None:
+                continue
+
+            # Split based on test_serial_numbers
+            if split == "train" and serial not in test_serials:
+                cases.append(case_id)
+            elif split == "test" and serial in test_serials:
+                cases.append(case_id)
+
+    return sorted(cases)
 
 
 def compute_gradient_magnitude(image: np.ndarray) -> np.ndarray:
@@ -299,7 +332,7 @@ def main():
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
 
-    cases = load_split_cases(args.split_cfg, args.split)
+    cases = load_split_cases(args.split_cfg, data_root, args.split)
     print(f"Processing {len(cases)} cases from {args.split} split")
     print(f"Budget: {args.budget_ratio:.4f} ({args.budget_ratio*100:.2f}%)")
     print(f"Class weights: {class_weights}")
