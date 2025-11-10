@@ -68,6 +68,8 @@ bash scripts/run_strategic_sparse_complete.sh
 1. Strategic seed sampling (~1,100 seeds per case, stratified by class)
 2. Multi-k label propagation (k=1,3,5,7,10,15,20,25,30,50)
 3. Parallel training across 2 GPUs for all 10 k variants
+   - 20 epochs, batch_size=2, BasicUNet
+   - Loss: 0.5 × CrossEntropy + 0.5 × Dice (ignore class 6)
 4. Estimated time: ~3h pipeline + ~10-15h training = 12-20h total
 
 **Options**:
