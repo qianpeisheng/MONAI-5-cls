@@ -57,23 +57,29 @@ def load_split_cases(split_cfg: str, data_root: Path, split: str = "train") -> l
         m = re.match(r"^SN(\d+)", name)
         return int(m.group(1)) if m else None
 
-    # Find all cases from image files
+    # Find all cases from image files (check both data_root and data_root/data)
     cases = []
-    for name in os.listdir(data_root):
-        if name.endswith("_image.nii"):
-            case_id = name[:-10]  # Remove '_image.nii'
-            serial = serial_from_name(case_id)
+    search_dirs = [data_root, data_root / "data"]
 
-            if serial is None:
-                continue
+    for search_dir in search_dirs:
+        if not search_dir.exists():
+            continue
 
-            # Split based on test_serial_numbers
-            if split == "train" and serial not in test_serials:
-                cases.append(case_id)
-            elif split == "test" and serial in test_serials:
-                cases.append(case_id)
+        for name in os.listdir(search_dir):
+            if name.endswith("_image.nii"):
+                case_id = name[:-10]  # Remove '_image.nii'
+                serial = serial_from_name(case_id)
 
-    return sorted(cases)
+                if serial is None:
+                    continue
+
+                # Split based on test_serial_numbers
+                if split == "train" and serial not in test_serials:
+                    cases.append(case_id)
+                elif split == "test" and serial in test_serials:
+                    cases.append(case_id)
+
+    return sorted(list(set(cases)))  # Remove duplicates
 
 
 def compute_gradient_magnitude(image: np.ndarray) -> np.ndarray:
@@ -226,19 +232,33 @@ def process_case(
 
     sv_ids = np.load(sv_ids_path)
 
-    # Load GT labels
-    label_path = data_root / case_id / f"{case_id}_label.nii"
-    if not label_path.exists():
-        label_path = data_root / f"{case_id}_label.nii"
-    if not label_path.exists():
+    # Load GT labels (check multiple locations)
+    label_paths = [
+        data_root / case_id / f"{case_id}_label.nii",
+        data_root / f"{case_id}_label.nii",
+        data_root / "data" / f"{case_id}_label.nii",
+    ]
+    label_path = None
+    for path in label_paths:
+        if path.exists():
+            label_path = path
+            break
+    if label_path is None:
         print(f"WARNING: GT label not found for {case_id}, skipping")
         return None
 
-    # Load image
-    image_path = data_root / case_id / f"{case_id}_image.nii"
-    if not image_path.exists():
-        image_path = data_root / f"{case_id}_image.nii"
-    if not image_path.exists():
+    # Load image (check multiple locations)
+    image_paths = [
+        data_root / case_id / f"{case_id}_image.nii",
+        data_root / f"{case_id}_image.nii",
+        data_root / "data" / f"{case_id}_image.nii",
+    ]
+    image_path = None
+    for path in image_paths:
+        if path.exists():
+            image_path = path
+            break
+    if image_path is None:
         print(f"WARNING: Image not found for {case_id}, skipping")
         return None
 
