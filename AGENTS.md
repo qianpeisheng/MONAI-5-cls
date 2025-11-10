@@ -436,6 +436,201 @@ python3 scripts/summarize_sv_training_results.py
 - Standard SLIC outperforms geometry-aware variants
 - All configs achieve 95-99% of fully-supervised performance
 
+## Strategic Sparse Supervoxel Labeling (0.1% Budget)
+
+A weakly-supervised approach that combines sparse annotation (0.1% of voxels) with supervoxel structure for label propagation.
+
+### Overview
+
+**Goal**: Train segmentation models using minimal annotations (0.1% of voxels ≈ 1,100 voxels/case) by:
+1. **Strategic sampling**: Distribute labeled voxels among supervoxels (max 1 per SV)
+2. **Label propagation**: Use k-NN to propagate labels from labeled SVs to unlabeled SVs
+
+**Key Features**:
+- Max 1 labeled voxel per supervoxel (no voting, direct assignment)
+- Prioritizes foreground borders (high gradient)
+- Prioritizes rare classes (3, 4 get 2x weight)
+- Multi-k experiments (k = 1,3,5,7,10,15,20,25,30,50)
+
+### End-to-End Pipeline
+
+```bash
+# Activate environment
+. /home/peisheng/MONAI/venv/bin/activate
+
+# Run complete pipeline (sampling + propagation + training directories)
+python3 scripts/pipeline_strategic_sparse_sv.py \
+  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
+  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
+  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+  --budget_ratio 0.001 \
+  --k_values 1,3,5,7,10,15,20,25,30,50 \
+  --output_dir runs/sv_sparse_prop_0p1pct_strategic \
+  --seed 42
+```
+
+**What it does**:
+1. Samples ~1,100 seeds per case (0.1% budget) strategically
+2. Assigns labels to ~13-15% of supervoxels (those with seeds)
+3. Propagates to remaining SVs using k-NN for all 10 k values
+4. Creates training directories: `k_variants/k{01,03,05,...}/`
+
+### Step-by-Step (Alternative)
+
+If you prefer to run steps separately:
+
+**Step 1: Strategic Seed Sampling**
+
+```bash
+python3 scripts/sample_strategic_sv_seeds.py \
+  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
+  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
+  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+  --budget_ratio 0.001 \
+  --class_weights 1,1,2,2 \
+  --output_dir runs/strategic_seeds_0p1pct \
+  --seed 42
+```
+
+**Outputs**:
+- `<case_id>_strategic_seeds.npy` - Binary mask of sampled voxels
+- `<case_id>_sv_labels_sparse.json` - Sparse SV labels (1:1 mapping, no voting)
+- `<case_id>_seeds_meta.json` - Statistics
+- `summary_stats.json` - Overall statistics
+
+**Step 2: Multi-k Label Propagation**
+
+```bash
+python3 scripts/propagate_sv_labels_multi_k.py \
+  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
+  --seeds_dir runs/strategic_seeds_0p1pct \
+  --k_values 1,3,5,7,10,15,20,25,30,50 \
+  --output_dir runs/sv_sparse_prop_0p1pct_strategic \
+  --seed 42
+```
+
+**Outputs**:
+- `cases/<case_id>/propagated_k01_labels.npy` - Dense labels for k=1
+- `cases/<case_id>/propagated_k03_labels.npy` - Dense labels for k=3
+- ... (one per k value)
+- `k_variants/k01/<case_id>_labels.npy` - Symlinks for training
+- `propagation_summary.json` - Statistics
+
+### Training on All K Variants (Parallel)
+
+Train models for all 10 k values across 2 GPUs:
+
+```bash
+bash scripts/train_all_k_variants.sh runs/sv_sparse_prop_0p1pct_strategic/k_variants
+```
+
+**What it does**:
+- Distributes 10 k values across 2 GPUs (5 per GPU)
+- Sequential execution within each GPU
+- Parallel across GPUs
+- Each run: 20 epochs, batch_size=2, BasicUNet
+- Saves to `runs/train_sv_sparse_k{01,03,05,...}/`
+
+**Monitor progress**:
+```bash
+# Watch GPU 0 jobs
+tail -f runs/train_sv_sparse_k01/train.log
+
+# Check completion
+ls -d runs/train_sv_sparse_k*/ | wc -l
+```
+
+**Optional flags**:
+```bash
+# Preview commands without executing
+bash scripts/train_all_k_variants.sh <k_variants_dir> --dry-run
+
+# Resume training (skip completed runs)
+bash scripts/train_all_k_variants.sh <k_variants_dir> --resume
+```
+
+### Directory Structure
+
+```
+runs/sv_sparse_prop_0p1pct_strategic/
+├── strategic_seeds/              # Step 1 outputs
+│   ├── SN13B0_..._strategic_seeds.npy
+│   ├── SN13B0_..._sv_labels_sparse.json
+│   ├── SN13B0_..._seeds_meta.json
+│   └── summary_stats.json
+├── cases/                         # Step 2 outputs
+│   ├── SN13B0_I17_3D_B1_1B250409/
+│   │   ├── sparse_sv_labels.json
+│   │   ├── propagated_k01_labels.npy
+│   │   ├── propagated_k03_labels.npy
+│   │   ├── ...
+│   │   ├── propagated_k50_labels.npy
+│   │   └── propagation_meta.json
+│   └── ... (380 cases)
+├── k_variants/                    # Training directories (symlinks)
+│   ├── k01/
+│   │   ├── SN13B0_..._labels.npy -> ../../cases/SN13B0.../propagated_k01_labels.npy
+│   │   └── ... (380 cases)
+│   ├── k03/
+│   ├── k05/
+│   ├── ...
+│   └── k50/
+└── propagation_summary.json
+
+runs/train_sv_sparse_k01/          # Training outputs
+    ├── best.ckpt
+    ├── last.ckpt
+    ├── train.log
+    └── metrics/
+runs/train_sv_sparse_k03/
+...
+runs/train_sv_sparse_k50/
+```
+
+### Expected Performance
+
+| Method | Training Labels | Test Dice (Expected) | % of 100% GT |
+|--------|----------------|----------------------|--------------|
+| 100% GT | 380 dense labels | 0.8718 | 100% |
+| 12k SV full GT | 380 SV-voted | 0.9089 | 104.3% |
+| 1% sparse points | ~1,100 points × 380 | 0.8310 | 95.3% |
+| **0.1% → SV prop (k=5)** | **~1,100 points × 380** | **~0.78-0.82 (?)** | **~90-94% (?)** |
+
+**Hypothesis**: Optimal k should be 5-10 (balances locality vs robustness).
+
+### Algorithm Details
+
+**Strategic Sampling**:
+```python
+# For each foreground supervoxel:
+#   1. Score voxels by:
+#      - Class weight: {1:1, 2:1, 3:2, 4:2} (prioritize rare)
+#      - Gradient magnitude (borders)
+#      - Distance to centroid (representativeness)
+#   2. Select top 1 voxel per SV
+# Rank all SVs globally by score, select top N within budget
+```
+
+**k-NN Propagation**:
+```python
+# For each unlabeled SV:
+#   1. Find k nearest labeled SVs (by centroid distance)
+#   2. Weighted vote: weight = 1 / (distance + ε)
+#   3. Assign majority label
+```
+
+### Testing
+
+Run comprehensive tests:
+```bash
+pytest tests/test_strategic_sparse_sv.py -v
+```
+
+**Test coverage**:
+- Strategic sampling (max 1 per SV, budget, FG priority, rare class priority, gradient)
+- Multi-k propagation (all k values, sparse preservation, voting, distance weighting)
+- Helper functions (centroids, gradients, SV-to-dense conversion)
+
 ## Where to look in this repo
 - `mednist_tutorial.ipynb` — reference for IO/transform patterns.
 - `WP5_Segmentation_Data_Guide.md` — authoritative WP5 data details, label policy, split.
