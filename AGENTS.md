@@ -452,6 +452,13 @@ A weakly-supervised approach that combines sparse annotation (0.1% of voxels) wi
 - Prioritizes rare classes (3, 4 get 2x weight)
 - Multi-k experiments (k = 1,3,5,7,10,15,20,25,30,50)
 
+**Status**: ✅ Implementation complete, tests passing (12/12), ready to run experiments
+
+**Recent Fixes** (2025-11-10):
+- Fixed split config parsing to handle `test_serial_numbers` format
+- Added support for `data/` subdirectory in dataset structure
+- All 380 training cases now load correctly
+
 ### End-to-End Pipeline
 
 ```bash
@@ -459,14 +466,7 @@ A weakly-supervised approach that combines sparse annotation (0.1% of voxels) wi
 . /home/peisheng/MONAI/venv/bin/activate
 
 # Run complete pipeline (sampling + propagation + training directories)
-python3 scripts/pipeline_strategic_sparse_sv.py \
-  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
-  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
-  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
-  --budget_ratio 0.001 \
-  --k_values 1,3,5,7,10,15,20,25,30,50 \
-  --output_dir runs/sv_sparse_prop_0p1pct_strategic \
-  --seed 42
+python3 scripts/pipeline_strategic_sparse_sv.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --k_values 1,3,5,7,10,15,20,25,30,50 --output_dir runs/strategic_sparse_0p1pct_k_multi --seed 42
 ```
 
 **What it does**:
@@ -475,6 +475,17 @@ python3 scripts/pipeline_strategic_sparse_sv.py \
 3. Propagates to remaining SVs using k-NN for all 10 k values
 4. Creates training directories: `k_variants/k{01,03,05,...}/`
 
+**Expected output**:
+```
+Processing 380 cases from train split
+Budget: 0.001 (0.10%)
+...
+STEP 1: Strategic Seed Sampling [COMPLETE]
+STEP 2: Multi-k Label Propagation [COMPLETE]
+Pipeline completed successfully!
+Output: runs/strategic_sparse_0p1pct_k_multi
+```
+
 ### Step-by-Step (Alternative)
 
 If you prefer to run steps separately:
@@ -482,14 +493,7 @@ If you prefer to run steps separately:
 **Step 1: Strategic Seed Sampling**
 
 ```bash
-python3 scripts/sample_strategic_sv_seeds.py \
-  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
-  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
-  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
-  --budget_ratio 0.001 \
-  --class_weights 1,1,2,2 \
-  --output_dir runs/strategic_seeds_0p1pct \
-  --seed 42
+python3 scripts/sample_strategic_sv_seeds.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --class_weights 1,1,2,2 --output_dir runs/strategic_seeds_0p1pct --seed 42
 ```
 
 **Outputs**:
@@ -501,12 +505,7 @@ python3 scripts/sample_strategic_sv_seeds.py \
 **Step 2: Multi-k Label Propagation**
 
 ```bash
-python3 scripts/propagate_sv_labels_multi_k.py \
-  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
-  --seeds_dir runs/strategic_seeds_0p1pct \
-  --k_values 1,3,5,7,10,15,20,25,30,50 \
-  --output_dir runs/sv_sparse_prop_0p1pct_strategic \
-  --seed 42
+python3 scripts/propagate_sv_labels_multi_k.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --seeds_dir runs/strategic_seeds_0p1pct --k_values 1,3,5,7,10,15,20,25,30,50 --output_dir runs/sv_sparse_prop_0p1pct_strategic --seed 42
 ```
 
 **Outputs**:
@@ -630,6 +629,23 @@ pytest tests/test_strategic_sparse_sv.py -v
 - Strategic sampling (max 1 per SV, budget, FG priority, rare class priority, gradient)
 - Multi-k propagation (all k values, sparse preservation, voting, distance weighting)
 - Helper functions (centroids, gradients, SV-to-dense conversion)
+
+### Troubleshooting
+
+**"Processing 0 cases from train split"**
+
+Fixed in commits c784aad3 and f14ce60e. The issue was that:
+1. Split config uses `{"test_serial_numbers": [9, 12, 15, ...]}` format
+2. Dataset files are in `data_root/data/` subdirectory
+3. Script now searches both `data_root/` and `data_root/data/` for image files
+4. Case IDs are extracted from serial numbers (SN13B0_... → serial 13)
+
+Verify the fix:
+```bash
+python3 -c "import os; from pathlib import Path; print(f'Cases: {len([n for n in os.listdir(Path(\"/data3/wp5/wp5-code/dataloaders/wp5-dataset/data\")) if n.endswith(\"_image.nii\")])}')"
+```
+
+Expected: `Cases: 560` (380 train + 180 test)
 
 ## Where to look in this repo
 - `mednist_tutorial.ipynb` — reference for IO/transform patterns.
