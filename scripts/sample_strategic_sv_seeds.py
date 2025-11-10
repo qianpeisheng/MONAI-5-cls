@@ -124,7 +124,7 @@ def sample_strategic_seeds(
         gt_labels: (X, Y, Z) int16, ground truth labels
         image: (X, Y, Z) float, intensity image
         budget_ratio: fraction of total voxels to sample (default 0.001 = 0.1%)
-        class_weights: Dict of class→weight (default: {1:1, 2:1, 3:2, 4:2})
+        class_weights: Dict of class→weight (default: {0:0.1, 1:1, 2:1, 3:2, 4:2})
         gradient_weight: weight for gradient component (default 1.0)
         centroid_weight: weight for centroid proximity (default 0.5)
 
@@ -133,75 +133,103 @@ def sample_strategic_seeds(
         seed_sv_labels: Dict {sv_id: label}, sparse SV labels (1:1 mapping)
     """
     if class_weights is None:
-        class_weights = {1: 1.0, 2: 1.0, 3: 2.0, 4: 2.0}
+        class_weights = {0: 0.1, 1: 1.0, 2: 1.0, 3: 2.0, 4: 2.0}
 
     # Calculate budget
     total_voxels = sv_ids.size
     max_seeds = int(total_voxels * budget_ratio)
 
-    # Identify foreground supervoxels
+    # Get all supervoxels (including background)
     sv_unique = np.unique(sv_ids)
-    fg_svs = []
+    all_svs = [int(sv_id) for sv_id in sv_unique]
 
-    for sv_id in sv_unique:
-        mask = (sv_ids == sv_id)
-        labels_in_sv = gt_labels[mask]
-        # Check if SV contains any FG class (1-4)
-        if np.any((labels_in_sv >= 1) & (labels_in_sv <= 4)):
-            fg_svs.append(sv_id)
-
-    print(f"  Found {len(fg_svs)} foreground SVs out of {len(sv_unique)} total")
+    print(f"  Processing {len(all_svs)} supervoxels")
 
     # Precompute gradient magnitude
     grad_mag = compute_gradient_magnitude(image)
 
-    # Score candidates within each FG SV
+    # Score candidates within each supervoxel
     sv_candidates = []  # List of (sv_id, voxel_coord, score, label)
 
-    for sv_id in tqdm(fg_svs, desc="  Scoring candidates", leave=False):
+    for sv_id in tqdm(all_svs, desc="  Scoring candidates", leave=False):
         mask = (sv_ids == sv_id)
         coords = np.argwhere(mask)
 
-        # Get labels and filter to FG only
+        # Get labels for all voxels in this SV
         labels = gt_labels[coords[:, 0], coords[:, 1], coords[:, 2]]
-        fg_mask = (labels >= 1) & (labels <= 4)
-        if fg_mask.sum() == 0:
+        valid_mask = (labels >= 0) & (labels <= 4)  # Valid classes only
+        if valid_mask.sum() == 0:
             continue
 
-        coords_fg = coords[fg_mask]
-        labels_fg = labels[fg_mask]
+        labels_valid = labels[valid_mask]
 
-        # Compute scores for each candidate voxel
-        scores = np.zeros(len(coords_fg), dtype=float)
+        # Determine dominant class in this SV
+        dominant_class = int(np.bincount(labels_valid).argmax())
 
-        # Component 1: Class priority (rare classes higher)
-        for i, label in enumerate(labels_fg):
-            scores[i] += class_weights.get(int(label), 0)
+        # Only sample voxels of the dominant class (to ensure class representation)
+        class_mask = (labels == dominant_class)
+        if class_mask.sum() == 0:
+            continue
+
+        coords_class = coords[class_mask]
+        labels_class = labels[class_mask]
+
+        # Compute scores for candidate voxels of this class
+        scores = np.zeros(len(coords_class), dtype=float)
+
+        # Component 1: Class priority weight
+        scores += class_weights.get(dominant_class, 0)
 
         # Component 2: Border proximity (gradient magnitude)
-        gradients = grad_mag[coords_fg[:, 0], coords_fg[:, 1], coords_fg[:, 2]]
+        gradients = grad_mag[coords_class[:, 0], coords_class[:, 1], coords_class[:, 2]]
         if gradients.max() > 0:
             scores += gradient_weight * (gradients / gradients.max())
 
         # Component 3: Representativeness (distance to centroid, inverted)
         centroid = coords.mean(axis=0)
-        distances = np.linalg.norm(coords_fg - centroid, axis=1)
+        distances = np.linalg.norm(coords_class - centroid, axis=1)
         if distances.max() > 0:
             scores -= centroid_weight * (distances / distances.max())
 
         # Select best candidate for this SV
         best_idx = scores.argmax()
-        best_coord = coords_fg[best_idx]
-        best_label = labels_fg[best_idx]
+        best_coord = coords_class[best_idx]
+        best_label = labels_class[best_idx]
         best_score = scores[best_idx]
 
         sv_candidates.append((int(sv_id), tuple(best_coord), best_score, int(best_label)))
 
-    # Rank all SV candidates globally and select top N within budget
-    sv_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score descending
-    selected_candidates = sv_candidates[:max_seeds]
+    # Stratified sampling: allocate budget proportionally to class frequency in GT
+    # First, compute class distribution in GT
+    unique_labels, label_counts = np.unique(gt_labels[(gt_labels >= 0) & (gt_labels <= 4)], return_counts=True)
+    class_freq = {int(label): count for label, count in zip(unique_labels, label_counts)}
+    total_freq = sum(class_freq.values())
 
-    print(f"  Selected {len(selected_candidates)} seeds (budget: {max_seeds})")
+    # Group candidates by class
+    candidates_by_class = {cls: [] for cls in range(5)}
+    for sv_id, coord, score, label in sv_candidates:
+        candidates_by_class[label].append((sv_id, coord, score, label))
+
+    # Allocate budget to each class proportionally
+    selected_candidates = []
+    for cls in range(5):
+        if cls not in class_freq or class_freq[cls] == 0:
+            continue
+
+        # Calculate target number of seeds for this class
+        class_ratio = class_freq[cls] / total_freq
+        class_budget = int(max_seeds * class_ratio)
+
+        # Select top candidates from this class
+        class_candidates = candidates_by_class[cls]
+        class_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score
+        selected_from_class = class_candidates[:class_budget]
+        selected_candidates.extend(selected_from_class)
+
+        if len(selected_from_class) > 0:
+            print(f"  Class {cls}: {len(selected_from_class):4d} seeds ({class_ratio*100:.1f}% of budget)")
+
+    print(f"  Total selected: {len(selected_candidates)} seeds (budget: {max_seeds})")
 
     # Create seed mask and SV label dict
     seed_mask = np.zeros_like(sv_ids, dtype=bool)
@@ -325,8 +353,8 @@ def main():
                        help="Split to process (default: train)")
     parser.add_argument("--budget_ratio", type=float, default=0.001,
                        help="Fraction of voxels to sample (default: 0.001 = 0.1%%)")
-    parser.add_argument("--class_weights", type=str, default="1,1,2,2",
-                       help="Class weights for 1,2,3,4 (default: 1,1,2,2)")
+    parser.add_argument("--class_weights", type=str, default="0.1,1,1,2,2",
+                       help="Class weights for 0,1,2,3,4 (default: 0.1,1,1,2,2)")
     parser.add_argument("--output_dir", type=str, required=True,
                        help="Output directory for seeds and metadata")
     parser.add_argument("--seed", type=int, default=42,
@@ -341,11 +369,11 @@ def main():
 
     # Parse class weights
     weights_list = [float(w) for w in args.class_weights.split(',')]
-    if len(weights_list) != 4:
-        print("ERROR: --class_weights must have 4 values (for classes 1,2,3,4)")
+    if len(weights_list) != 5:
+        print("ERROR: --class_weights must have 5 values (for classes 0,1,2,3,4)")
         sys.exit(1)
-    class_weights = {1: weights_list[0], 2: weights_list[1],
-                    3: weights_list[2], 4: weights_list[3]}
+    class_weights = {0: weights_list[0], 1: weights_list[1], 2: weights_list[2],
+                    3: weights_list[3], 4: weights_list[4]}
 
     # Load cases
     sv_dir = Path(args.sv_dir)

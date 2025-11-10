@@ -493,14 +493,16 @@ If you prefer to run steps separately:
 **Step 1: Strategic Seed Sampling**
 
 ```bash
-python3 scripts/sample_strategic_sv_seeds.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --class_weights 1,1,2,2 --output_dir runs/strategic_seeds_0p1pct --seed 42
+python3 scripts/sample_strategic_sv_seeds.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --class_weights 0.1,1,1,2,2 --output_dir runs/strategic_seeds_0p1pct --seed 42
 ```
 
 **Outputs**:
 - `<case_id>_strategic_seeds.npy` - Binary mask of sampled voxels
 - `<case_id>_sv_labels_sparse.json` - Sparse SV labels (1:1 mapping, no voting)
-- `<case_id>_seeds_meta.json` - Statistics
+- `<case_id>_seeds_meta.json` - Statistics (includes class distribution)
 - `summary_stats.json` - Overall statistics
+
+**Note**: Class weights are `0.1,1,1,2,2` for classes 0,1,2,3,4 respectively. Class 0 (background) gets lower weight (0.1) due to its large proportion and ease of learning.
 
 **Step 2: Multi-k Label Propagation**
 
@@ -646,6 +648,26 @@ python3 -c "import os; from pathlib import Path; print(f'Cases: {len([n for n in
 ```
 
 Expected: `Cases: 560` (380 train + 180 test)
+
+**"No class 0 (background) in sampled seeds"**
+
+Fixed in commit [TBD]. The root cause was that even background-dominant SVs were contributing foreground seeds because:
+1. Per-SV selection scored all voxels together
+2. FG voxels had 10-20x higher class weights (1.0-2.0 vs 0.1)
+3. FG voxels always won within mixed SVs
+
+**Solution**:
+1. Determine each SV's dominant class (via majority vote)
+2. Only sample voxels of that dominant class from each SV
+3. Use stratified sampling to allocate budget proportionally to GT class frequency
+4. Result: Seed distribution matches GT distribution (~64% class 0, ~18% class 1, etc.)
+
+Verify class distribution in a sample output:
+```bash
+python3 -c "import json; f='runs/strategic_sparse_0p1pct_k_multi/strategic_seeds/summary_stats.json'; print(json.dumps(json.load(open(f))['total_class_distribution'], indent=2))"
+```
+
+Expected: Class 0 should have ~64% of seeds
 
 ## Where to look in this repo
 - `mednist_tutorial.ipynb` — reference for IO/transform patterns.

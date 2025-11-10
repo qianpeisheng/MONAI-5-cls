@@ -20,10 +20,7 @@ A complete pipeline for training segmentation models with minimal annotations (0
 
 ## Recent Bug Fixes
 
-**Commits**:
-- `c784aad3` - Fixed split config parsing for `test_serial_numbers` format
-- `f14ce60e` - Added support for `data/` subdirectory in dataset structure
-- `91e7666d` - Updated documentation with troubleshooting and commands
+### Fix 1: "Processing 0 cases" (Commits: c784aad3, f14ce60e)
 
 **Issue**: Pipeline was loading 0 cases from train split
 
@@ -34,6 +31,28 @@ A complete pipeline for training segmentation models with minimal annotations (0
 4. Split based on serial number membership
 
 **Result**: Now correctly loads 380 training cases
+
+### Fix 2: "No class 0 (background) in seeds" (Commit: [TBD])
+
+**Issue**: Sampled seeds contained no class 0 (background), only foreground classes
+
+**Root Cause**:
+- Per-SV selection scored all voxels together
+- FG voxels had 10-20x higher class weights (1.0-2.0 vs 0.1)
+- Even in background-dominant SVs, FG voxels always won
+
+**Solution**:
+1. Determine each SV's dominant class (via majority vote)
+2. Only sample voxels of that dominant class from each SV
+3. Use stratified sampling to allocate budget proportionally to GT class frequency
+4. Updated class weights to `0.1,1,1,2,2` for classes 0,1,2,3,4
+
+**Result**: Seed distribution now matches GT distribution
+- Class 0: ~64% (was 0%)
+- Class 1: ~18% (was 1%)
+- Class 2: ~12% (was 2%)
+- Class 3: ~3% (was 34%)
+- Class 4: ~4% (was 63%)
 
 ## Commands to Run Experiments
 
