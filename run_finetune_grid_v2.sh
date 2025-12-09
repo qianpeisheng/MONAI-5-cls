@@ -10,8 +10,8 @@
 #   PRETRAINED_CKPT=/path/to/pretrained.ckpt bash run_finetune_grid_v2.sh
 #
 # Optional env overrides:
-#   DATA_ROOT=/data3/wp5/wp5-code/dataloaders/wp5-dataset \
-#   SPLIT_CFG=/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+#   DATA_ROOT=/data3/wp5_4_Dec_data/3ddl-dataset \
+#   SPLIT_CFG=/data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json \
 #   GPUS="0 1" EPOCHS=100 BATCH_SIZE=2 LR=1e-3 NUM_WORKERS=4 SEED=42 \
 #   NORM=clip_zscore OUT_ROOT=runs/grid_clipz \
 #   bash run_finetune_grid_v2.sh
@@ -19,8 +19,8 @@
 set -euo pipefail
 
 # Inputs and defaults
-DATA_ROOT=${DATA_ROOT:-/data3/wp5/wp5-code/dataloaders/wp5-dataset}
-SPLIT_CFG=${SPLIT_CFG:-/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json}
+DATA_ROOT=${DATA_ROOT:-/data3/wp5_4_Dec_data/3ddl-dataset}
+SPLIT_CFG=${SPLIT_CFG:-/data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json}
 GPUS=${GPUS:-"0 1"}
 EPOCHS=${EPOCHS:-100}
 BATCH_SIZE=${BATCH_SIZE:-2}

@@ -8,8 +8,8 @@ set -euo pipefail
 # - Schedules all runs on GPU 1.
 
 # Config (override via env)
-DATA_ROOT=${DATA_ROOT:-/data3/wp5/wp5-code/dataloaders/wp5-dataset}
-SPLIT_CFG=${SPLIT_CFG:-/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json}
+DATA_ROOT=${DATA_ROOT:-/data3/wp5_4_Dec_data/3ddl-dataset}
+SPLIT_CFG=${SPLIT_CFG:-/data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json}
 EPOCHS=${EPOCHS:-20}
 BATCH_SIZE=${BATCH_SIZE:-2}
 LR=${LR:-1e-3}

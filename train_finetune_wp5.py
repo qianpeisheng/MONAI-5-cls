@@ -6,8 +6,8 @@ Usage examples:
 
 Train on full data and evaluate each epoch (defaults: BasicUNet, scratch init):
   python train_finetune_wp5.py --mode train \
-    --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
-    --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+    --data_root /data3/wp5_4_Dec_data/3ddl-dataset \
+    --split_cfg /data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json \
     --output_dir runs/wp5_finetune_full --subset_ratio 1.0 --epochs 50 --batch_size 2 --lr 1e-4
 
 Train on 10% (deterministic subset) and evaluate:
@@ -79,6 +79,8 @@ try:
 except Exception:  # pragma: no cover
     Novograd = None
 
+logger = logging.getLogger(__name__)
+
 
 def set_seed(seed: int):
     random.seed(seed)
@@ -89,7 +91,144 @@ def set_seed(seed: int):
 
 
 def build_datalists(data_dir: Path, cfg_path: Path) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Build MONAI-style train/test datalists for WP5-style segmentation.
+
+    This function supports two dataset layouts:
+
+    1) New-style BumpDataset layout (default/recommended):
+       - data_dir: path to directory containing 'images/', 'labels/', 'metadata.jsonl'
+       - cfg_path: dataset_config.json (with loader_version, test/train serials)
+       - Uses the external BumpDataset loader to enumerate samples and splits.
+       - Filters to type='3D' samples for segmentation experiments.
+
+    2) Legacy flat layout (original WP5 dataset):
+       - data_dir: directory containing *.nii with names like 'SN.._image.nii'
+       - cfg_path: split JSON with 'test_serial_numbers' (e.g. 3ddl_split_config_*.json)
+       - Uses filename-derived serial numbers to construct splits.
+
+    No silent fallbacks are performed:
+    - If cfg_path does not exist, a FileNotFoundError is raised.
+    - If cfg_path looks like a new-style config but the expected BumpDataset
+      loader or data structure is missing, an explicit error is raised.
+    - Legacy layout is only used when cfg_path does NOT declare a loader_version.
+    """
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Split/config file not found: {cfg_path}")
+
     cfg = json.loads(cfg_path.read_text())
+
+    # New-style dataset_config.json with BumpDataset (preferred).
+    if "loader_version" in cfg:
+        dataset_root = cfg_path.parent
+        metadata_path = dataset_root / "metadata.jsonl"
+        images_dir = dataset_root / "images"
+        labels_dir = dataset_root / "labels"
+        missing = [p for p in (metadata_path, images_dir, labels_dir) if not p.exists()]
+        if missing:
+            raise FileNotFoundError(
+                "New-style dataset_config.json detected but required dataset structure is incomplete.\n"
+                f"Expected paths under {dataset_root}:\n"
+                f"  - {metadata_path}\n"
+                f"  - {images_dir}\n"
+                f"  - {labels_dir}\n"
+                f"Missing: {', '.join(str(m) for m in missing)}"
+            )
+
+        loader_py = dataset_root.parent / "dataset_loader.py"
+        if not loader_py.exists():
+            raise FileNotFoundError(
+                "New-style dataset_config.json detected but BumpDataset loader not found.\n"
+                f"Expected dataset_loader.py at: {loader_py}"
+            )
+
+        # Dynamic import of external BumpDataset implementation.
+        from importlib.machinery import SourceFileLoader
+
+        module_name = "wp5_bump_dataset_loader"
+        mod = SourceFileLoader(module_name, str(loader_py)).load_module()
+        if not hasattr(mod, "BumpDataset"):
+            raise AttributeError(
+                f"Module {loader_py} does not define 'BumpDataset'; "
+                "cannot build datalists for new-style dataset."
+            )
+        BumpDataset = mod.BumpDataset  # type: ignore[attr-defined]
+
+        ds = BumpDataset(data_dir=str(dataset_root))
+        # For segmentation we restrict to 3D samples.
+        ds_3d = ds.filter(type="3D")
+
+        train_serials_cfg = cfg.get("train_serial_numbers") or []
+        test_serials_cfg = cfg.get("test_serial_numbers", [])
+
+        if train_serials_cfg and test_serials_cfg:
+            raise ValueError(
+                f"Config {cfg_path} defines both train_serial_numbers and test_serial_numbers; "
+                "segmentation pipeline expects exactly one of these to be non-empty."
+            )
+
+        if train_serials_cfg:
+            requested_serials = set(int(s) for s in train_serials_cfg)
+        else:
+            if not test_serials_cfg:
+                raise ValueError(
+                    f"Config {cfg_path} must define at least one of "
+                    "'train_serial_numbers' or 'test_serial_numbers'."
+                )
+            requested_serials = set(int(s) for s in test_serials_cfg)
+
+        # Enforce consistency between config and dataset serial numbers.
+        available_serials_all = set(int(s) for s in ds.serial_numbers)
+        missing_in_dataset = sorted(requested_serials - available_serials_all)
+        if missing_in_dataset:
+            logger.warning(
+                "dataset_config.json references serial_numbers that are not present in the dataset; "
+                "they will be ignored.\nConfig: %s\nMissing serial_numbers: %s",
+                cfg_path,
+                missing_in_dataset,
+            )
+
+        available_serials_3d = set(int(s) for s in ds_3d.serial_numbers)
+        missing_in_3d = sorted(requested_serials - available_serials_3d)
+        if missing_in_3d:
+            logger.warning(
+                "dataset_config.json references serial_numbers that have no 3D samples after filtering "
+                "type='3D'; they will be excluded from 3D segmentation splits.\n"
+                "Config: %s\nSerial_numbers without 3D samples: %s",
+                cfg_path,
+                missing_in_3d,
+            )
+
+        # Perform the split on the 3D subset.
+        if train_serials_cfg:
+            train_ds, test_ds = ds_3d.split(train_serial_numbers=list(train_serials_cfg))
+        else:
+            train_ds, test_ds = ds_3d.split(test_serial_numbers=list(test_serials_cfg))
+
+        train_list: List[Dict] = []
+        test_list: List[Dict] = []
+
+        for i in range(len(train_ds)):
+            meta = train_ds.get_metadata(i)
+            rec = {
+                "image": meta["image_path"],
+                "label": meta["label_path"],
+                "id": meta["pair_id"],
+            }
+            train_list.append(rec)
+
+        for i in range(len(test_ds)):
+            meta = test_ds.get_metadata(i)
+            rec = {
+                "image": meta["image_path"],
+                "label": meta["label_path"],
+                "id": meta["pair_id"],
+            }
+            test_list.append(rec)
+
+        return train_list, test_list
+
+    # Legacy flat layout: infer pairs from filenames and split by serial.
     test_serials = set(cfg.get("test_serial_numbers", []))
 
     def serial_from_name(n: str):
@@ -2082,8 +2221,18 @@ def _init_run_logging(out_dir: str, enable: bool = True, filename: str = "train.
 def parse_args(argv: List[str] | None = None):
     p = argparse.ArgumentParser(description="WP5 Fine-tuning (use scripts/eval_wp5.py for evaluation)")
     p.add_argument("--mode", choices=["train"], default="train", help="Run mode (only 'train' supported)")
-    p.add_argument("--data_root", type=str, default="/data3/wp5/wp5-code/dataloaders/wp5-dataset", help="WP5 dataset root (contains data/)")
-    p.add_argument("--split_cfg", type=str, default="/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json", help="Predefined split config JSON")
+    p.add_argument(
+        "--data_root",
+        type=str,
+        default="/data3/wp5_4_Dec_data/3ddl-dataset",
+        help="WP5 dataset root (new default: contains 'data/' with images/, labels/, metadata.jsonl)",
+    )
+    p.add_argument(
+        "--split_cfg",
+        type=str,
+        default="/data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json",
+        help="Dataset split/config JSON (new default: dataset_config.json for BumpDataset layout)",
+    )
     p.add_argument("--output_dir", type=str, default="runs/wp5_finetune", help="Output directory (base path)")
     p.add_argument(
         "--train_label_override_dir",

@@ -1,12 +1,208 @@
+## Codex Agent – Development Style Guidelines (Deep Learning)
+
+### Core Principles
+- Follow a **test-driven mindset**: when adding/modifying functionality, think about tests first.
+- Prefer **unit tests** for most development tasks.  
+- Only use **full train/eval pipelines** when absolutely necessary to validate end-to-end behavior.
+
+### Handling Tests in Deep Learning Codebases
+- When writing tests, default to **unit-level testing** (e.g., small functions, modules, components).  
+- For integration tests that require training/eval loops, always switch to a **fast testing mode**:
+  - e.g., 1 epoch, a few batches, smaller models/datasets, or any accelerated configuration.
+  - The exact approach is up to you (Codex) based on the codebase.
+
+### Expectations for Codex
+When implementing new features or changes:
+1. **State the testing plan first**  
+   - What will be unit tested  
+   - Whether a lightweight pipeline test is needed  
+2. **Write/update the relevant tests before writing code**  
+3. Use a **pragmatic, fast testing configuration** for any full-pipeline checks  
+4. Then write/modify the implementation to satisfy those tests  
+5. Keep changes minimal, readable, and aligned with the existing code structure
+
+### Flexibility
+- Codex has full discretion on how to implement tests and what constitutes “lightweight” for the specific codebase.
+- There is no requirement on tensor shapes, dataset size, etc. — Codex should choose the simplest setup that makes tests reliable and fast.
+- Tiny changes (logging, naming, comments) may not need tests.
+
+### Summary
+The goal is to keep development fast, safe, and incremental:
+- **Unit tests first**,  
+- **Fast integration tests when needed**,  
+- **Implementation after the tests**,  
+- **No long/heavy training by default**.
+
 # AGENTS.md — Using MONAI here for WP5‑style 3D Segmentation
 
-This guide orients you (and any agents) to use this MONAI checkout for medical image segmentation on datasets like WP5. It assumes you have data in NIfTI pairs (image/label) similar to `/data3/wp5/wp5-code/dataloaders/wp5-dataset/data` and a working notebook `mednist_tutorial.ipynb` in this folder.
+This guide orients you (and any agents) to use this MONAI checkout for medical image segmentation on datasets like WP5. It assumes you have data in NIfTI pairs (image/label) using the **new default WP5 dataset layout** at `/data3/wp5_4_Dec_data/3ddl-dataset/data` and a working notebook `mednist_tutorial.ipynb` in this folder.
+
+**Dataset defaults and no‑fallback policy**
+- New default dataset root: `/data3/wp5_4_Dec_data/3ddl-dataset` (contains `data/images`, `data/labels`, `data/metadata.jsonl`, `data/dataset_config.json`, plus `dataset_loader.py`).
+- Training/eval code (`train_finetune_wp5.py`, `scripts/eval_wp5.py`, `scripts/gen_datalists.py`, `scripts/check_split.py`) now use this new layout by default via the external `BumpDataset` loader.
+- The legacy dataset at `/data3/wp5/wp5-code/dataloaders/wp5-dataset` is still supported, but **only when explicitly passed via `--data_root` and `--split_cfg`**.
+- There is **no silent fallback between datasets**: if you point `--data_root`/`--split_cfg` at an invalid or partially‑present new dataset, the code raises a clear error instead of falling back to the legacy layout.
+- If a split/config JSON references serial numbers that are not present (or do not have 3D samples for segmentation), this is explicitly logged as a warning and those serials are ignored for 3D segmentation splits. No alternative dataset layout is used implicitly; fix the config if you need strict 1:1 coverage.
 
 Key references in this repo:
 - Notebook: `mednist_tutorial.ipynb` (classification tutorial — reuse its env, transforms, and DataLoader patterns)
 - Data spec for WP5: `WP5_Segmentation_Data_Guide.md` (labels, splits, transforms, pitfalls)
 
 Scope: All code under this directory. Keep changes minimal, adopt MONAI idioms, avoid leaking domain‑specific assumptions unless documented here.
+
+## Class Label Definitions (CRITICAL - READ THIS FIRST!)
+
+**WP5 Dataset has 5 valid classes + 1 ignore class:**
+
+| Class ID | Name | Description | Treatment |
+|----------|------|-------------|-----------|
+| **-1** | **Unlabeled** | **Missing/unavailable label** | Voxels not yet labeled (sparse annotations) |
+| **0** | **Background** | **Valid label** (air, empty space) | Include in training and evaluation |
+| 1 | Foreground 1 | Valid label | Include in training and evaluation |
+| 2 | Foreground 2 | Valid label | Include in training and evaluation |
+| 3 | Foreground 3 | Valid label (rare) | Include in training and evaluation |
+| 4 | Foreground 4 | Valid label (rare) | Include in training and evaluation |
+| 6 | Ignore/Unknown | Invalid/ambiguous regions | **Ignore in loss and metrics** |
+
+**CRITICAL DISTINCTIONS:**
+- **Class -1**: Unlabeled voxels (missing data, not yet annotated) - use for sparse labels
+- **Class 0 (background)**: A **VALID LABEL** representing real background voxels
+- **Class 6**: Invalid/ambiguous regions in ground truth - ignore in training and metrics
+- **NEVER** confuse class 0 (valid background) with -1 (unlabeled) or 6 (ignore)!
+
+**Coverage Metrics:**
+- **Dense labels**: All voxels are labeled (classes 0-4), no -1 values
+- **Sparse labels**: Mix of labeled voxels (0-4) and unlabeled voxels (-1)
+- **Coverage calculation**: `coverage = np.sum(labels >= 0) / labels.size`
+  - This counts all valid labels (0-4), excluding unlabeled (-1)
+  - For dense labels, coverage should be 1.0 (100%)
+  - For sparse labels, coverage < 1.0
+
+**Common Mistakes to Avoid:**
+- ✗ Wrong: `coverage = np.count_nonzero(labels) / labels.size`
+  - This excludes class 0 and treats background as unlabeled!
+- ✗ Wrong: `labeled_mask = labels > 0`
+  - This treats class 0 (background) as unlabeled!
+- ✓ Correct: `labeled_mask = labels >= 0`
+  - Includes all valid classes (0-4), excludes unlabeled (-1)
+- ✓ Correct: `foreground_mask = labels > 0`
+  - Only when you specifically want foreground classes (1-4), not for "labeled" check
+
+**Default class weights for sparse sampling:**
+- Class 0: 0.1 (abundant, easy to learn)
+- Classes 1,2: 1.0 (moderate frequency)
+- Classes 3,4: 2.0 (rare, need more emphasis)
+
+## Common Evaluation Pitfalls (IMPORTANT - AVOID THESE MISTAKES!)
+
+### 1. Coverage vs Foreground Proportion
+
+**WRONG:**
+```python
+coverage = np.count_nonzero(labels) / labels.size  # Excludes class 0!
+```
+This is **NOT coverage** - it's the **foreground proportion** (% of voxels that are classes 1-4).
+
+**CORRECT:**
+```python
+coverage = np.sum(labels >= 0) / labels.size  # Includes all valid labels
+```
+This correctly counts all labeled voxels (classes 0-4), excluding only unlabeled (-1).
+
+**Example:**
+- Labels: `[0, 0, 1, 2, -1]` (3 background, 1 class 1, 1 class 2, 1 unlabeled)
+- ✗ Wrong formula: `3/5 = 60%` (excludes class 0, treats background as unlabeled!)
+- ✓ Correct formula: `4/5 = 80%` (excludes only -1)
+
+### 2. Seed File Formats
+
+**Two separate files per case:**
+- `{case_id}_strategic_seeds.npy`: **Boolean mask** (True/False) indicating which voxels are seeds
+- `{case_id}_sv_labels_sparse.json`: **Actual class labels** (SV ID → class mapping)
+
+**WRONG:** Loading boolean mask as class labels
+```python
+seeds = np.load(f'{case_id}_strategic_seeds.npy')  # This is bool, not classes!
+seed_labels = seeds  # All True → 1, gives "all seeds are class 1"
+```
+
+**CORRECT:** Load from appropriate file based on need
+```python
+# For seed locations (which voxels):
+seed_mask = np.load(f'{case_id}_strategic_seeds.npy')  # bool array
+
+# For seed class labels (what class):
+import json
+with open(f'{case_id}_sv_labels_sparse.json') as f:
+    sv_labels = json.load(f)['sv_labels']  # dict: SV ID → class
+```
+
+### 3. Voxel Accuracy vs Dice Score
+
+**Voxel Accuracy:**
+```python
+accuracy = np.mean(predicted == ground_truth)
+```
+- Counts individual voxels where prediction matches GT
+- **Class imbalance matters!** Background (74% of voxels) dominates this metric
+- Example: 90% accuracy could mean perfect background + terrible foreground
+
+**Dice Score (per-class):**
+```python
+dice = 2 * intersection / (pred_count + gt_count)
+```
+- Measures overlap quality for each class independently
+- **Balanced across classes** - each class weighted equally
+- Better metric for imbalanced datasets
+
+**When to use which:**
+- **Voxel accuracy:** Overall quality check, easy to interpret
+- **Dice score:** Per-class performance, handles imbalance, standard for segmentation
+
+### 4. Dense vs Sparse Labels
+
+**Dense labels:** All voxels have valid labels (classes 0-4), no -1 values
+- Example: Graph LP output, fully-supervised labels, voted supervoxel labels
+- Coverage = 100%
+
+**Sparse labels:** Some voxels unlabeled (-1), only partial labeling
+- Example: Strategic seeds (0.1% budget), few-shot annotations
+- Coverage < 100%
+
+**Check before evaluation:**
+```python
+has_unlabeled = np.any(labels == -1)
+coverage = np.sum(labels >= 0) / labels.size
+print(f'Dense: {not has_unlabeled}, Coverage: {coverage:.1%}')
+```
+
+### 5. Seed Accuracy Calculation
+
+**For strategic seeds with separate mask + label files:**
+
+```python
+# Load seed mask and GT
+seed_mask = np.load(f'{case_id}_strategic_seeds.npy')  # bool
+gt = load_ground_truth(case_id)  # int16
+
+# Extract GT labels at seed locations
+seed_voxels = seed_mask.astype(bool)
+gt_at_seeds = gt[seed_voxels]
+
+# Load actual seed class labels from JSON
+with open(f'{case_id}_sv_labels_sparse.json') as f:
+    sv_labels = json.load(f)['sv_labels']  # SV ID → class
+
+# Convert SV labels to voxel labels using SV IDs
+# (requires loading supervoxel ID map)
+sv_ids = np.load(f'{case_id}_sv_ids.npy')
+seed_labels = np.array([sv_labels[str(sv_ids[idx])] for idx in seed_indices])
+
+# Now compute accuracy
+accuracy = np.mean(seed_labels == gt_at_seeds)
+```
+
+**WRONG approach:** Loading boolean mask as labels gives nonsense accuracy.
 
 ## Command Presentation (for agents)
 - Always show runnable Python and shell commands in a single line when responding. This avoids terminals treating only the first line as the command and silently dropping subsequent flags when users paste multi‑line snippets.
@@ -21,11 +217,17 @@ Scope: All code under this directory. Keep changes minimal, adopt MONAI idioms, 
 ## Data Shape and Labels (WP5‑like)
 - 3D NIfTI volumes, float32 images, uint16 labels.
 - Variable spatial shapes; keep spacing as is unless you standardize later.
-- Label values observed: `{0,1,2,3,4,6}` where `0` is background; ignore class `6` by default for training and metrics (see policy below).
-- Default split (WP5): train 380, test 180 via predefined serial‑number config.
+- **Canonical label semantics for both legacy and new WP5 datasets:**
+  - Label values: `{0,1,2,3,4,6}`.
+  - Class `0`: background (valid label, always included in training and metrics).
+  - Classes `1–4`: foreground classes (valid, included in training and metrics).
+  - Class `6`: ignore/unknown (excluded from loss and metrics by default; see policy below).
+- These semantics were established on the original 560‑case WP5 dataset and are preserved unchanged in the new default dataset under `/data3/wp5_4_Dec_data/3ddl-dataset`.
+- Default split (legacy WP5): train 380, test 180 via predefined serial‑number config.  
+  For the new dataset, splits are defined in `dataset_config.json` and, for 3D segmentation with the current config, yield 352 train and 105 test cases (type=`\"3D\"` subset).
 
 ## Default Policies (important!)
-- Split: Use the predefined serial split if applicable (train=380, test=180 on WP5).
+- Split: For the **legacy** dataset, use the predefined serial split (train=380, test=180). For the **new** dataset, rely on `dataset_config.json` and `BumpDataset.split()`; the exact counts are config‑dependent.
 - Classes and ignore: compute metrics over classes `0..4` and ignore label `6`.
   - CrossEntropy: set `ignore_index=6` (or remap `6→4` to get 5 classes).
   - Dice: mask voxels where `label==6` before computing per‑class Dice.
@@ -35,7 +237,11 @@ Scope: All code under this directory. Keep changes minimal, adopt MONAI idioms, 
 ## Data Lists (recommended structure)
 Create JSON lists for train/test with entries like `{ "image": "/path/.._image.nii", "label": "/path/.._label.nii", "id": "..." }`. Examples are in `WP5_Segmentation_Data_Guide.md`.
 
-Quick generator for WP5 split (adjust paths as needed):
+Quick generator for WP5 split using the **legacy** flat dataset layout (adjust paths as needed). For the new default BumpDataset layout under `/data3/wp5_4_Dec_data/3ddl-dataset`, prefer:
+
+`python3 scripts/gen_datalists.py --data_root /data3/wp5_4_Dec_data/3ddl-dataset --split_cfg /data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json`
+
+Legacy example (kept for reference):
 ```python
 import os, json, re
 from pathlib import Path
@@ -206,25 +412,27 @@ for epoch in range(50):
 
 ## Plans for Your 3 Tasks
 
+The high‑level experiment plans below were originally written and partially explored on the **legacy 560‑case WP5 dataset**. They still describe recommended workflows conceptually, but **we do not yet have confirmed runs or metrics on the new default dataset** at `/data3/wp5_4_Dec_data/3ddl-dataset`. Treat any numbers mentioned elsewhere as legacy‑dataset references only.
+
 1) Directly use pretrained model zoo models on WP5
 - Pick a 3D bundle compatible with single‑channel input.
 - Replace final layer to match WP5 classes (5 if merging `6→4`), load pretrained weights with `strict=False`.
 - Run sliding‑window inference; report metrics over classes `0..4` (ignore 6).
 - Risk: domain shift from CT/MRI to industrial X‑ray; expect low baseline but useful for comparison.
 
-2) Fine‑tune pretrained models on full WP5 train (380)
+2) Fine‑tune pretrained models on full WP5 train
 - Initialize from the same pretrained backbone; use learning rate 1e‑4 to 3e‑4, patch size `(112,112,80)`.
 - Augment with flips; consider RandGaussianNoise/Intensity if helpful.
-- Loss: CE(ignore 6) + Dice(0..4). Train 100–300 epochs or 20k–50k iterations depending on batch.
-- Validate on the 180 test set; save the best checkpoint by Dice.
+- Loss: CE(ignore 6) + Dice(0..4).
+- For the legacy dataset, prior work used 380 train / 180 test; for the new dataset, train/test counts are driven by `dataset_config.json` and are **not yet benchmarked**.
 
-3) Few‑shot fine‑tune (≈1% of train ≈ 4 samples)
-- Sample 1% from the 380 train (stratify over serial numbers if possible).
+3) Few‑shot fine‑tune (≈1% of train)
+- Sample ~1% of the training volumes (or voxels) using a deterministic procedure.
 - Freeze early layers (encoder) for first 50–100 epochs, then unfreeze.
 - Heavier regularization (weight decay), stronger data aug.
 - Consider pseudo‑labeling unlabeled train volumes after initial fine‑tune.
 
-Sampling snippet:
+Sampling snippet (legacy‑style datalist; update paths if you regenerate on the new dataset):
 ```python
 import json, random
 train = json.load(open('datalist_train.json'))
@@ -252,6 +460,9 @@ json.dump([train[i] for i in few], open('datalist_train_1pct.json','w'), indent=
 - Spacing: NIfTI headers often are 1.0mm; re-spacing not required unless you want standardization.
 
 ## Training with Supervoxel-Voted Labels
+
+**Scope / dataset note:**  
+All concrete paths, label directories, and Dice scores in this section refer to experiments on the **legacy WP5 dataset** under `/data3/wp5/wp5-code/dataloaders/wp5-dataset` (train=380, test=180). The supervoxel pipelines and `--train_label_override_dir` machinery are still available in the codebase, but **we have not yet run or validated analogous experiments on the new default dataset** at `/data3/wp5_4_Dec_data/3ddl-dataset`. Treat the numbers below as legacy baselines only, not as results for the new dataset.
 
 You can train segmentation models using supervoxel-voted labels instead of original ground truth labels. This is useful for:
 - Training with pseudo-labels generated from supervoxel voting
@@ -318,14 +529,14 @@ python3 train_finetune_wp5.py \
   --net basicunet
 ```
 
-### Available Supervoxel Label Directories
+### Available Supervoxel Label Directories (legacy dataset only)
 
-From the parameter sweep (see `runs/sv_sweep_ras2_summary.md` for full results):
-- **Best overall**: `/data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted` (Dice: 0.9149)
-- **Balanced**: `/data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted` (Dice: 0.9089)
+From the parameter sweep on the **legacy WP5 dataset** (see `runs/sv_sweep_ras2_summary.md` for full results):
+- **Best overall (legacy)**: `/data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted` (Dice: 0.9149)
+- **Balanced (legacy)**: `/data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted` (Dice: 0.9089)
 - **Legacy 5k**: `/home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted` (documented earlier)
 
-All contain 380 train cases with voted labels in `.npy` format.
+All of these contain 380 train cases with voted labels in `.npy` format for the legacy dataset. No corresponding sweeps have been run yet on the new default dataset.
 
 ### Validation
 
@@ -431,10 +642,12 @@ python3 scripts/summarize_sv_training_results.py
 - Generates publication-ready plots with seaborn styling
 - Creates self-contained report with relative image paths (view in any markdown viewer)
 
-**Example findings:**
+**Example findings (legacy dataset only):**
 - Best: slic n=18000 → 0.8656 Dice (99.3% of 100% GT baseline)
 - Standard SLIC outperforms geometry-aware variants
 - All configs achieve 95-99% of fully-supervised performance
+
+These findings have **not** yet been reproduced on the new default dataset.
 
 ## Strategic Sparse Supervoxel Labeling (0.1% Budget)
 
@@ -596,7 +809,9 @@ runs/train_sv_sparse_k03/
 runs/train_sv_sparse_k50/
 ```
 
-### Expected Performance
+### Expected Performance (legacy dataset only)
+
+The table below summarizes **legacy** experiments on the original 560‑case WP5 dataset (380 train / 180 test). These numbers are **not** available for the new default dataset yet and should be treated purely as historical reference.
 
 | Method | Training Labels | Test Dice (Expected) | % of 100% GT |
 |--------|----------------|----------------------|--------------|
@@ -605,7 +820,7 @@ runs/train_sv_sparse_k50/
 | 1% sparse points | ~1,100 points × 380 | 0.8310 | 95.3% |
 | **0.1% → SV prop (k=5)** | **~1,100 points × 380** | **~0.78-0.82 (?)** | **~90-94% (?)** |
 
-**Hypothesis**: Optimal k should be 5-10 (balances locality vs robustness).
+**Hypothesis** (legacy): Optimal k should be 5–10 (balances locality vs robustness). New‑dataset performance is currently unknown.
 
 ### Algorithm Details
 

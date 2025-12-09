@@ -7,8 +7,8 @@ set -euo pipefail
 # - Saves static masks to <run>/sup_masks and uses them every epoch (reproducible with --seed).
 
 # Config (override via env)
-DATA_ROOT=${DATA_ROOT:-/data3/wp5/wp5-code/dataloaders/wp5-dataset}
-SPLIT_CFG=${SPLIT_CFG:-/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json}
+DATA_ROOT=${DATA_ROOT:-/data3/wp5_4_Dec_data/3ddl-dataset}
+SPLIT_CFG=${SPLIT_CFG:-/data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json}
 BUNDLE_DIR=${BUNDLE_DIR:-pretrained_models/spleen_ct_segmentation/spleen_ct_segmentation}
 PRETRAINED_CKPT=${PRETRAINED_CKPT:-$BUNDLE_DIR/models/model.pt}
 EPOCHS=${EPOCHS:-20}

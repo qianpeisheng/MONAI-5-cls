@@ -15,11 +15,11 @@ Examples:
     --output_dir runs/grid_clip_zscore/scratch_subset_100/eval \
     --save_preds --heavy --hd_percentile 95 --empty_pair_policy count_as_one
 
-Or build the test list via WP5 split config:
+Or build the test list via WP5 split config (new default dataset layout):
   python scripts/eval_wp5.py \
     --ckpt runs/grid_clip_zscore/scratch_subset_100/last.ckpt \
-    --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
-    --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+    --data_root /data3/wp5_4_Dec_data/3ddl-dataset \
+    --split_cfg /data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json \
     --output_dir runs/grid_clip_zscore/scratch_subset_100_eval \
     --save_preds
 """
@@ -118,8 +118,18 @@ def get_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_dir", type=str, required=True, help="Base dir to save metrics/predictions (timestamp appended unless --no_timestamp)")
     # Dataset
     p.add_argument("--datalist", type=str, default="datalist_test.json", help="JSON list for test set")
-    p.add_argument("--data_root", type=str, default="", help="WP5 dataset root (if not using --datalist)")
-    p.add_argument("--split_cfg", type=str, default="", help="Split config JSON (if not using --datalist)")
+    p.add_argument(
+        "--data_root",
+        type=str,
+        default="",
+        help="WP5 dataset root (new default layout: contains 'data/' with images/, labels/, metadata.jsonl)",
+    )
+    p.add_argument(
+        "--split_cfg",
+        type=str,
+        default="",
+        help="Split/config JSON (new default: dataset_config.json under <data_root>/data)",
+    )
     # Model and transforms
     p.add_argument("--net", choices=["basicunet"], default="basicunet")
     p.add_argument("--bundle_dir", type=str, default="", help="MONAI bundle directory (optional)")
