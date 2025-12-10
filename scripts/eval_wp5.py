@@ -69,11 +69,21 @@ def _init_eval_logging(out_dir: Path, enable: bool = True, filename: str = "eval
 
 
 def load_test_list(args) -> List[Dict]:
-    if args.datalist and Path(args.datalist).exists():
-        return json.loads(Path(args.datalist).read_text())
-    if args.data_root and args.split_cfg:
-        _, test_list = tfw.build_datalists(Path(args.data_root) / "data", Path(args.split_cfg))
+    # Prefer config-based split when provided (new default WP5 dataset layout).
+    # This keeps evaluation consistent with train_finetune_wp5, which always
+    # uses build_datalists(data_root / "data", split_cfg).
+    if getattr(args, "data_root", "") and getattr(args, "split_cfg", ""):
+        data_dir = Path(args.data_root) / "data"
+        cfg_path = Path(args.split_cfg)
+        print(f"Building test datalist from split config: data_dir={data_dir}, split_cfg={cfg_path}")
+        _, test_list = tfw.build_datalists(data_dir, cfg_path)
         return test_list
+
+    # Fallback: explicit JSON datalist (legacy usage or custom lists).
+    if getattr(args, "datalist", "") and Path(args.datalist).exists():
+        print(f"Loading test datalist from JSON: {args.datalist}")
+        return json.loads(Path(args.datalist).read_text())
+
     raise FileNotFoundError(
         "Provide --datalist path or both --data_root and --split_cfg to locate the test set.")
 
@@ -141,7 +151,21 @@ def get_parser() -> argparse.ArgumentParser:
     # Eval options
     p.add_argument("--save_preds", action="store_true", help="Save predictions as NIfTI under <output_dir>/preds")
     p.add_argument("--max_cases", type=int, default=-1, help="Limit number of evaluated cases (for smoke tests)")
-    p.add_argument("--heavy", action="store_true", help="Also compute HD/ASD (slower)")
+    # By default, standalone eval computes full metrics (Dice/IoU + HD/ASD).
+    # Use --fast to disable HD/ASD when only Dice/IoU are needed.
+    p.add_argument(
+        "--heavy",
+        dest="heavy",
+        action="store_true",
+        default=True,
+        help="Compute HD/ASD metrics (default: enabled; use --fast to disable).",
+    )
+    p.add_argument(
+        "--fast",
+        dest="heavy",
+        action="store_false",
+        help="Skip HD/ASD metrics (Dice/IoU only; faster).",
+    )
     p.add_argument("--hd_percentile", type=float, default=95.0, help="Hausdorff percentile: 95.0 for HD95, 100.0 for full HD")
     p.add_argument("--no_timestamp", action="store_true", help="Do not append timestamp to --output_dir")
     # logging

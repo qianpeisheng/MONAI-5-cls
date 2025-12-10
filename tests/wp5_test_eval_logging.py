@@ -1,9 +1,12 @@
 import os
-import sys
 import tempfile
 import unittest
+import importlib.util
+
+_torch_available = importlib.util.find_spec("torch") is not None
 
 
+@unittest.skipUnless(_torch_available, "torch not available")
 class TestEvalLogging(unittest.TestCase):
     def test_eval_logging_writes_file(self):
         import scripts.eval_wp5 as ev
@@ -19,4 +22,3 @@ class TestEvalLogging(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

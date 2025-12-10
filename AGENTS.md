@@ -224,7 +224,8 @@ accuracy = np.mean(seed_labels == gt_at_seeds)
   - Class `6`: ignore/unknown (excluded from loss and metrics by default; see policy below).
 - These semantics were established on the original 560‑case WP5 dataset and are preserved unchanged in the new default dataset under `/data3/wp5_4_Dec_data/3ddl-dataset`.
 - Default split (legacy WP5): train 380, test 180 via predefined serial‑number config.  
-  For the new dataset, splits are defined in `dataset_config.json` and, for 3D segmentation with the current config, yield 352 train and 105 test cases (type=`\"3D\"` subset).
+  For the new dataset, splits are defined in `dataset_config.json` and use **all entries referenced by the config**, regardless of any BumpDataset `type` flag (`2D`/`2.5D`/`3D`).  
+  Do **not** filter by `type` when building datalists or train/test splits. For the current config (no type filtering), you should see approximately 613 train and 174 test samples (787 total), but the exact counts remain config‑dependent.
 
 ## Default Policies (important!)
 - Split: For the **legacy** dataset, use the predefined serial split (train=380, test=180). For the **new** dataset, rely on `dataset_config.json` and `BumpDataset.split()`; the exact counts are config‑dependent.

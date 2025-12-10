@@ -100,7 +100,7 @@ def build_datalists(data_dir: Path, cfg_path: Path) -> Tuple[List[Dict], List[Di
        - data_dir: path to directory containing 'images/', 'labels/', 'metadata.jsonl'
        - cfg_path: dataset_config.json (with loader_version, test/train serials)
        - Uses the external BumpDataset loader to enumerate samples and splits.
-       - Filters to type='3D' samples for segmentation experiments.
+       - IMPORTANT: does **not** filter by any 'type' field (e.g. '2D', '2.5D', '3D').
 
     2) Legacy flat layout (original WP5 dataset):
        - data_dir: directory containing *.nii with names like 'SN.._image.nii'
@@ -154,9 +154,10 @@ def build_datalists(data_dir: Path, cfg_path: Path) -> Tuple[List[Dict], List[Di
             )
         BumpDataset = mod.BumpDataset  # type: ignore[attr-defined]
 
+        # NOTE: We intentionally do **not** filter by any BumpDataset
+        # 'type' field (e.g. '2D', '2.5D', '3D'). All entries referenced
+        # by the split config participate in train/test splits.
         ds = BumpDataset(data_dir=str(dataset_root))
-        # For segmentation we restrict to 3D samples.
-        ds_3d = ds.filter(type="3D")
 
         train_serials_cfg = cfg.get("train_serial_numbers") or []
         test_serials_cfg = cfg.get("test_serial_numbers", [])
@@ -188,22 +189,11 @@ def build_datalists(data_dir: Path, cfg_path: Path) -> Tuple[List[Dict], List[Di
                 missing_in_dataset,
             )
 
-        available_serials_3d = set(int(s) for s in ds_3d.serial_numbers)
-        missing_in_3d = sorted(requested_serials - available_serials_3d)
-        if missing_in_3d:
-            logger.warning(
-                "dataset_config.json references serial_numbers that have no 3D samples after filtering "
-                "type='3D'; they will be excluded from 3D segmentation splits.\n"
-                "Config: %s\nSerial_numbers without 3D samples: %s",
-                cfg_path,
-                missing_in_3d,
-            )
-
-        # Perform the split on the 3D subset.
+        # Perform the split on the full dataset (no type-based filtering).
         if train_serials_cfg:
-            train_ds, test_ds = ds_3d.split(train_serial_numbers=list(train_serials_cfg))
+            train_ds, test_ds = ds.split(train_serial_numbers=list(train_serials_cfg))
         else:
-            train_ds, test_ds = ds_3d.split(test_serial_numbers=list(test_serials_cfg))
+            train_ds, test_ds = ds.split(test_serial_numbers=list(test_serials_cfg))
 
         train_list: List[Dict] = []
         test_list: List[Dict] = []
@@ -2224,14 +2214,14 @@ def parse_args(argv: List[str] | None = None):
     p.add_argument(
         "--data_root",
         type=str,
-        default="/data3/wp5_4_Dec_data/3ddl-dataset",
-        help="WP5 dataset root (new default: contains 'data/' with images/, labels/, metadata.jsonl)",
+        required=True,
+        help="WP5 dataset root (must contain 'data/' with images/, labels/, metadata.jsonl).",
     )
     p.add_argument(
         "--split_cfg",
         type=str,
-        default="/data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json",
-        help="Dataset split/config JSON (new default: dataset_config.json for BumpDataset layout)",
+        required=True,
+        help="Dataset split/config JSON (e.g., dataset_config.json for BumpDataset layout).",
     )
     p.add_argument("--output_dir", type=str, default="runs/wp5_finetune", help="Output directory (base path)")
     p.add_argument(
