@@ -159,6 +159,7 @@ tags
 # profiling results
 *.prof
 runs
+tmp/
 
 *.gz
 
