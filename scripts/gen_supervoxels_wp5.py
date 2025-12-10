@@ -51,6 +51,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Dict, Optional, Sequence, Tuple
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 
 try:
@@ -94,6 +96,12 @@ def parse_args() -> argparse.Namespace:
             "Assign every supervoxel a label by majority vote over full GT labels; "
             "respects --ignore-class. Overrides --no-fill and does not require --sup-dir."
         ),
+    )
+    ap.add_argument(
+        "--num-workers",
+        type=int,
+        default=1,
+        help="Number of parallel workers over cases (1=sequential).",
     )
     return ap.parse_args()
 
@@ -253,6 +261,160 @@ def assign_all_from_gt(
     return out, int(n_nonzero_svs), float(fill_fraction)
 
 
+def _resolve_image_label_paths(data_root: Path, cid: str) -> Tuple[Optional[Path], Optional[Path]]:
+    """
+    Resolve image/label paths for a given case id, supporting both the
+    legacy flat WP5 layout and the new BumpDataset layout.
+
+    Legacy WP5:
+      data_root / \"data\" / \"<id>_image.nii\"
+      data_root / \"data\" / \"<id>_label.nii\"
+
+    New BumpDataset:
+      data_root / \"data\" / \"images\" / \"<id>_image.nii\"
+      data_root / \"data\" / \"labels\" / \"<id>_label.nii\"
+    """
+    candidates_img = [
+        data_root / "data" / f"{cid}_image.nii",
+        data_root / "data" / "images" / f"{cid}_image.nii",
+        data_root / "images" / f"{cid}_image.nii",
+    ]
+    candidates_lbl = [
+        data_root / "data" / f"{cid}_label.nii",
+        data_root / "data" / "labels" / f"{cid}_label.nii",
+        data_root / "labels" / f"{cid}_label.nii",
+    ]
+
+    ip = next((p for p in candidates_img if p.exists()), None)
+    lp = next((p for p in candidates_lbl if p.exists()), None)
+    return ip, lp
+
+
+def _process_case(
+    cid: str,
+    data_root: Path,
+    out_dir: Path,
+    sup_dir: Optional[Path],
+    ref_header: str,
+    n_segments: int,
+    compactness: float,
+    sigma: float,
+    mode: str,
+    grad_sigma: float,
+    ignore_class: Optional[int],
+    no_fill: bool,
+    assign_from_gt: bool,
+) -> None:
+    """Process a single case id: load, run SLIC, assign labels, and save outputs."""
+    t0 = time.time()
+    ip, lp = _resolve_image_label_paths(data_root, cid)
+    if not ip or not lp:
+        print(f"skip {cid}: missing image/label")
+        return
+
+    # Choose header for orientation + spacing
+    ref_nii_path = lp if ref_header == "label" else ip
+    spacing_xyz, xform = nifti_meta(ref_nii_path) if _HAS_NIB else ((1.0, 1.0, 1.0), None)
+
+    # Load arrays
+    if not _HAS_NIB:
+        raise RuntimeError("nibabel is required: pip install -U nibabel")
+    img = nib.load(str(ip))
+    lab = nib.load(str(lp))
+    img_arr = np.asarray(img.get_fdata()).astype(np.float32)
+    lab_arr = np.asarray(lab.get_fdata()).astype(np.int16)
+    # Reorient to RAS per chosen reference
+    img_arr = apply_ornt(img_arr, xform)
+    lab_arr = apply_ornt(lab_arr, xform)
+    # Optional seeds
+    seed_arr = None
+    if sup_dir and (sup_dir / f"{cid}_seedmask.npy").exists():
+        seed_src = np.load(str(sup_dir / f"{cid}_seedmask.npy"))
+        seed_arr = apply_ornt(seed_src, xform)
+
+    # Normalize and construct features per mode
+    img_norm = pclip_zscore(img_arr)
+
+    channel_axis: Optional[int]
+    img_for_slic: np.ndarray
+    if mode == "slic":
+        img_for_slic = img_norm
+        channel_axis = None
+    else:
+        # Compute gradient-based features
+        try:
+            from skimage.filters import gaussian  # type: ignore
+            img_smooth = gaussian(img_norm, sigma=float(grad_sigma), preserve_range=True)
+        except Exception:
+            img_smooth = img_norm
+        dx, dy, dz = spacing_xyz
+        gx, gy, gz = np.gradient(img_smooth, dx, dy, dz)
+        if mode == "slic-grad-mag":
+            gmag = np.sqrt(gx * gx + gy * gy + gz * gz).astype(np.float32)
+            # z-score each channel for balance
+            ch0 = pclip_zscore(img_norm)
+            ch1 = pclip_zscore(gmag)
+            img_for_slic = np.stack([ch0, ch1], axis=-1)
+        elif mode == "slic-grad-vec":
+            chs = [pclip_zscore(c.astype(np.float32)) for c in (img_norm, gx, gy, gz)]
+            img_for_slic = np.stack(chs, axis=-1)
+        else:
+            img_for_slic = img_norm
+        channel_axis = -1
+
+    sv_ids = compute_supervoxels(
+        img=img_for_slic,
+        n_segments=n_segments,
+        compactness=compactness,
+        sigma=sigma,
+        spacing_xyz=spacing_xyz,
+        channel_axis=channel_axis,
+    )
+
+    # Label assignment mode
+    if assign_from_gt:
+        labels, n_filled_svs, fill_frac = assign_all_from_gt(
+            sv_ids=sv_ids,
+            gt_labels=lab_arr,
+            ignore_class=ignore_class,
+        )
+        mode_str = "full_gt"
+    elif no_fill:
+        labels = np.zeros_like(lab_arr, dtype=np.int16)
+        n_filled_svs = 0
+        fill_frac = 0.0
+        mode_str = "no_fill"
+    else:
+        labels, n_filled_svs, fill_frac = fill_from_seeds(
+            sv_ids=sv_ids,
+            seedmask=seed_arr,
+            gt_labels=lab_arr,
+            ignore_class=ignore_class,
+        )
+        mode_str = "seed_fill"
+
+    # Save
+    np.save(str(out_dir / f"{cid}_sv_ids.npy"), sv_ids.astype(np.int32))
+    np.save(str(out_dir / f"{cid}_labels.npy"), labels.astype(np.int16))
+    meta: Dict = {
+        "id": cid,
+        "shape": list(sv_ids.shape),
+        "n_voxels": int(sv_ids.size),
+        "n_svs": int(np.unique(sv_ids).size),
+        "n_filled_svs": int(n_filled_svs),
+        "fill_fraction": float(fill_frac),
+        "seed_fraction": float(float(seed_arr.astype(bool).sum()) / float(seed_arr.size)) if seed_arr is not None else 0.0,
+        "spacing_xyz": list(spacing_xyz),
+        "orientation": "RAS",
+        "mode": mode_str,
+        "slic_mode": mode,
+        "grad_sigma": float(grad_sigma),
+        "seconds": float(time.time() - t0),
+    }
+    (out_dir / f"{cid}_sv_meta.json").write_text(json.dumps(meta, indent=2))
+    print(f"{cid}: sv={meta['n_svs']} filled={meta['n_filled_svs']} fill_frac={meta['fill_fraction']:.4f} time={meta['seconds']:.2f}s")
+
+
 def main() -> None:
     args = parse_args()
     data_root = Path(args.data_root)
@@ -261,116 +423,56 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ids = load_ids(data_root, Path(args.datalist) if args.datalist else None, args.ids)
-    img_dir = data_root / "data"
 
-    for cid in ids:
-        t0 = time.time()
-        ip = img_dir / f"{cid}_image.nii"
-        lp = img_dir / f"{cid}_label.nii"
-        if not ip.exists() or not lp.exists():
-            print(f"skip {cid}: missing image/label")
-            continue
-        # Choose header for orientation + spacing
-        ref_nii_path = lp if args.ref_header == "label" else ip
-        spacing_xyz, xform = nifti_meta(ref_nii_path) if _HAS_NIB else ((1.0, 1.0, 1.0), None)
+    num_workers = max(int(args.num_workers), 1)
+    num_workers = min(num_workers, len(ids)) if ids else 0
 
-        # Load arrays
-        if not _HAS_NIB:
-            raise RuntimeError("nibabel is required: pip install -U nibabel")
-        img = nib.load(str(ip))
-        lab = nib.load(str(lp))
-        img_arr = np.asarray(img.get_fdata()).astype(np.float32)
-        lab_arr = np.asarray(lab.get_fdata()).astype(np.int16)
-        # Reorient to RAS per chosen reference
-        img_arr = apply_ornt(img_arr, xform)
-        lab_arr = apply_ornt(lab_arr, xform)
-        # Optional seeds
-        seed_arr = None
-        if sup_dir and (sup_dir / f"{cid}_seedmask.npy").exists():
-            seed_src = np.load(str(sup_dir / f"{cid}_seedmask.npy"))
-            seed_arr = apply_ornt(seed_src, xform)
-
-        # Normalize and construct features per mode
-        img_norm = pclip_zscore(img_arr)
-
-        channel_axis = None
-        img_for_slic: np.ndarray
-        if args.mode == "slic":
-            img_for_slic = img_norm
-            channel_axis = None
-        else:
-            # Compute gradient-based features
-            try:
-                from skimage.filters import gaussian  # type: ignore
-                img_smooth = gaussian(img_norm, sigma=float(args.grad_sigma), preserve_range=True)
-            except Exception:
-                img_smooth = img_norm
-            dx, dy, dz = spacing_xyz
-            gx, gy, gz = np.gradient(img_smooth, dx, dy, dz)
-            if args.mode == "slic-grad-mag":
-                gmag = np.sqrt(gx * gx + gy * gy + gz * gz).astype(np.float32)
-                # z-score each channel for balance
-                ch0 = pclip_zscore(img_norm)
-                ch1 = pclip_zscore(gmag)
-                img_for_slic = np.stack([ch0, ch1], axis=-1)
-            elif args.mode == "slic-grad-vec":
-                chs = [pclip_zscore(c.astype(np.float32)) for c in (img_norm, gx, gy, gz)]
-                img_for_slic = np.stack(chs, axis=-1)
-            else:
-                img_for_slic = img_norm
-            channel_axis = -1
-
-        sv_ids = compute_supervoxels(
-            img=img_for_slic,
-            n_segments=args.n_segments,
-            compactness=args.compactness,
-            sigma=args.sigma,
-            spacing_xyz=spacing_xyz,
-            channel_axis=channel_axis,
-        )
-
-        # Label assignment mode
-        if args.assign_all_from_gt:
-            labels, n_filled_svs, fill_frac = assign_all_from_gt(
-                sv_ids=sv_ids,
-                gt_labels=lab_arr,
+    if num_workers <= 1:
+        # Sequential processing (original behavior)
+        for cid in ids:
+            _process_case(
+                cid=cid,
+                data_root=data_root,
+                out_dir=out_dir,
+                sup_dir=sup_dir,
+                ref_header=args.ref_header,
+                n_segments=args.n_segments,
+                compactness=args.compactness,
+                sigma=args.sigma,
+                mode=args.mode,
+                grad_sigma=args.grad_sigma,
                 ignore_class=args.ignore_class,
+                no_fill=args.no_fill,
+                assign_from_gt=args.assign_all_from_gt,
             )
-            mode = "full_gt"
-        elif args.no_fill:
-            labels = np.zeros_like(lab_arr, dtype=np.int16)
-            n_filled_svs = 0
-            fill_frac = 0.0
-            mode = "no_fill"
-        else:
-            labels, n_filled_svs, fill_frac = fill_from_seeds(
-                sv_ids=sv_ids,
-                seedmask=seed_arr,
-                gt_labels=lab_arr,
-                ignore_class=args.ignore_class,
-            )
-            mode = "seed_fill"
-
-        # Save
-        np.save(str(out_dir / f"{cid}_sv_ids.npy"), sv_ids.astype(np.int32))
-        np.save(str(out_dir / f"{cid}_labels.npy"), labels.astype(np.int16))
-        meta: Dict = {
-            "id": cid,
-            "shape": list(sv_ids.shape),
-            "n_voxels": int(sv_ids.size),
-            "n_svs": int(np.unique(sv_ids).size),
-            "n_filled_svs": int(n_filled_svs),
-            "fill_fraction": float(fill_frac),
-            "seed_fraction": float(float(seed_arr.astype(bool).sum()) / float(seed_arr.size)) if seed_arr is not None else 0.0,
-            "spacing_xyz": list(spacing_xyz),
-            "orientation": "RAS",
-            "mode": mode,
-            "slic_mode": args.mode,
-            "grad_sigma": float(args.grad_sigma),
-            "seconds": float(time.time() - t0),
-        }
-        (out_dir / f"{cid}_sv_meta.json").write_text(json.dumps(meta, indent=2))
-        print(f"{cid}: sv={meta['n_svs']} filled={meta['n_filled_svs']} fill_frac={meta['fill_fraction']:.4f} time={meta['seconds']:.2f}s")
+    else:
+        print(f"Using {num_workers} workers over {len(ids)} cases")
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            futures = {
+                ex.submit(
+                    _process_case,
+                    cid,
+                    data_root,
+                    out_dir,
+                    sup_dir,
+                    args.ref_header,
+                    args.n_segments,
+                    args.compactness,
+                    args.sigma,
+                    args.mode,
+                    args.grad_sigma,
+                    args.ignore_class,
+                    args.no_fill,
+                    args.assign_all_from_gt,
+                ): cid
+                for cid in ids
+            }
+            for fut in as_completed(futures):
+                cid = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"ERROR processing {cid}: {e}")
 
 
 if __name__ == "__main__":

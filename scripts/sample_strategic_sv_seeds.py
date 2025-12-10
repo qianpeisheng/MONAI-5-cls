@@ -30,6 +30,8 @@ from pathlib import Path
 from collections import Counter
 from typing import Dict, Tuple
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 from scipy.ndimage import sobel
 from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, Orientationd
@@ -57,9 +59,11 @@ def load_split_cases(split_cfg: str, data_root: Path, split: str = "train") -> l
         m = re.match(r"^SN(\d+)", name)
         return int(m.group(1)) if m else None
 
-    # Find all cases from image files (check both data_root and data_root/data)
+    # Find all cases from image files (support both legacy flat layout and new BumpDataset layout)
     cases = []
-    search_dirs = [data_root, data_root / "data"]
+    # Legacy: data_root or data_root/data contains *_image.nii
+    # New BumpDataset: images live in data_root/images (we pass data_root=/path/to/.../data)
+    search_dirs = [data_root, data_root / "data", data_root / "images"]
 
     for search_dir in search_dirs:
         if not search_dir.exists():
@@ -106,6 +110,7 @@ def sample_strategic_seeds(
     class_weights: Dict[int, float] = None,
     gradient_weight: float = 1.0,
     centroid_weight: float = 0.5,
+    verbose: bool = True,
 ) -> Tuple[np.ndarray, Dict[int, int]]:
     """
     Strategic seed sampling to maximize supervoxel coverage.
@@ -143,7 +148,8 @@ def sample_strategic_seeds(
     sv_unique = np.unique(sv_ids)
     all_svs = [int(sv_id) for sv_id in sv_unique]
 
-    print(f"  Processing {len(all_svs)} supervoxels")
+    if verbose:
+        print(f"  Processing {len(all_svs)} supervoxels")
 
     # Precompute gradient magnitude
     grad_mag = compute_gradient_magnitude(image)
@@ -151,7 +157,8 @@ def sample_strategic_seeds(
     # Score candidates within each supervoxel
     sv_candidates = []  # List of (sv_id, voxel_coord, score, label)
 
-    for sv_id in tqdm(all_svs, desc="  Scoring candidates", leave=False):
+    iterable = tqdm(all_svs, desc="  Scoring candidates", leave=False) if verbose else all_svs
+    for sv_id in iterable:
         mask = (sv_ids == sv_id)
         coords = np.argwhere(mask)
 
@@ -226,10 +233,11 @@ def sample_strategic_seeds(
         selected_from_class = class_candidates[:class_budget]
         selected_candidates.extend(selected_from_class)
 
-        if len(selected_from_class) > 0:
+        if verbose and len(selected_from_class) > 0:
             print(f"  Class {cls}: {len(selected_from_class):4d} seeds ({class_ratio*100:.1f}% of budget)")
 
-    print(f"  Total selected: {len(selected_candidates)} seeds (budget: {max_seeds})")
+    if verbose:
+        print(f"  Total selected: {len(selected_candidates)} seeds (budget: {max_seeds})")
 
     # Create seed mask and SV label dict
     seed_mask = np.zeros_like(sv_ids, dtype=bool)
@@ -249,6 +257,7 @@ def process_case(
     output_dir: Path,
     budget_ratio: float,
     class_weights: Dict[int, float],
+    verbose: bool = True,
 ) -> Dict:
     """Process one case: load data, sample seeds, save outputs."""
 
@@ -260,11 +269,13 @@ def process_case(
 
     sv_ids = np.load(sv_ids_path)
 
-    # Load GT labels (check multiple locations)
+    # Load GT labels (check multiple locations / layouts)
     label_paths = [
         data_root / case_id / f"{case_id}_label.nii",
         data_root / f"{case_id}_label.nii",
         data_root / "data" / f"{case_id}_label.nii",
+        data_root / "labels" / f"{case_id}_label.nii",
+        data_root / "data" / "labels" / f"{case_id}_label.nii",
     ]
     label_path = None
     for path in label_paths:
@@ -275,11 +286,13 @@ def process_case(
         print(f"WARNING: GT label not found for {case_id}, skipping")
         return None
 
-    # Load image (check multiple locations)
+    # Load image (check multiple locations / layouts)
     image_paths = [
         data_root / case_id / f"{case_id}_image.nii",
         data_root / f"{case_id}_image.nii",
         data_root / "data" / f"{case_id}_image.nii",
+        data_root / "images" / f"{case_id}_image.nii",
+        data_root / "data" / "images" / f"{case_id}_image.nii",
     ]
     image_path = None
     for path in image_paths:
@@ -304,7 +317,7 @@ def process_case(
 
     # Sample seeds
     seed_mask, seed_sv_labels = sample_strategic_seeds(
-        sv_ids, gt_labels, image, budget_ratio, class_weights
+        sv_ids, gt_labels, image, budget_ratio, class_weights, verbose=verbose
     )
 
     # Compute statistics
@@ -339,6 +352,27 @@ def process_case(
         json.dump(meta, f, indent=2)
 
     return meta
+
+
+def _process_case_worker(payload: Tuple[str, str, str, str, float, Dict[int, float]]) -> Dict:
+    """Wrapper for multiprocessing: payload carries only picklable types."""
+    case_id, sv_dir_str, data_root_str, output_dir_str, budget_ratio, class_weights = payload
+    sv_dir = Path(sv_dir_str)
+    data_root = Path(data_root_str)
+    output_dir = Path(output_dir_str)
+    try:
+        return process_case(
+            case_id=case_id,
+            sv_dir=sv_dir,
+            data_root=data_root,
+            output_dir=output_dir,
+            budget_ratio=budget_ratio,
+            class_weights=class_weights,
+            verbose=False,
+        )
+    except Exception as e:
+        print(f"ERROR processing {case_id}: {e}")
+        return None
 
 
 def main():
@@ -385,13 +419,41 @@ def main():
     print(f"Budget: {args.budget_ratio:.4f} ({args.budget_ratio*100:.2f}%)")
     print(f"Class weights: {class_weights}")
 
-    # Process all cases
     all_meta = []
-    for case_id in tqdm(cases, desc="Processing cases"):
-        print(f"\nCase: {case_id}")
-        meta = process_case(case_id, sv_dir, data_root, output_dir, args.budget_ratio, class_weights)
-        if meta:
-            all_meta.append(meta)
+    num_workers = max(int(args.num_workers), 1)
+    num_workers = min(num_workers, len(cases)) if cases else 0
+
+    if num_workers <= 1:
+        # Sequential processing (original behavior)
+        for case_id in tqdm(cases, desc="Processing cases"):
+            meta = process_case(
+                case_id=case_id,
+                sv_dir=sv_dir,
+                data_root=data_root,
+                output_dir=output_dir,
+                budget_ratio=args.budget_ratio,
+                class_weights=class_weights,
+                verbose=True,
+            )
+            if meta:
+                all_meta.append(meta)
+    else:
+        print(f"Using {num_workers} workers over {len(cases)} cases")
+        payloads = [
+            (case_id, str(sv_dir), str(data_root), str(output_dir), float(args.budget_ratio), class_weights)
+            for case_id in cases
+        ]
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            futures = [ex.submit(_process_case_worker, pl) for pl in payloads]
+            try:
+                for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing cases"):
+                    meta = fut.result()
+                    if meta:
+                        all_meta.append(meta)
+            except KeyboardInterrupt:
+                print("KeyboardInterrupt received, shutting down workers...")
+                ex.shutdown(wait=False, cancel_futures=True)
+                raise
 
     # Summary statistics
     if all_meta:
