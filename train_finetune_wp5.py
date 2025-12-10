@@ -889,6 +889,39 @@ class LoadSavedMasksD(MapTransform):
         return d
 
 
+class LoadLabelSourceD(MapTransform):
+    """Load per-voxel label source masks (Graph LP reliability) by case id.
+
+    Expects files saved as <dir>/<id>_source.npy with shape (X,Y,Z) or (1,X,Y,Z).
+    Values are interpreted as binary flags: 1 => SV had GT-derived seed(s), 0 => graph-only.
+    """
+
+    def __init__(self, keys: list[str], id_key: str, dir_path: str):
+        super().__init__(keys)
+        self.id_key = id_key
+        self.dir = Path(dir_path) if dir_path else None
+
+    def __call__(self, data):
+        import numpy as np
+        d = dict(data)
+        if not self.dir:
+            return d
+        case_id = d.get(self.id_key)
+        if isinstance(case_id, list) and case_id:
+            case_id = case_id[0]
+        if case_id is None:
+            return d
+        safe_id = str(case_id).replace('/', '_')
+        srcp = self.dir / f"{safe_id}_source.npy"
+        if srcp.exists():
+            arr = np.load(srcp)
+            # Ensure channel-first shape (1,X,Y,Z)
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            d["label_source"] = arr.astype(np.float32)
+        return d
+
+
 def get_transforms(
     roi=(112, 112, 80),
     norm: str = "clip_zscore",
@@ -909,6 +942,7 @@ def get_transforms(
     fp_seed_strategy: str = "random",
     fp_no_overlap: bool = False,
     save_sup_masks_dir: str | None = None,
+    label_source_dir: str | None = None,
 ):
     norm_transform = None
     if norm == "clip_zscore":
@@ -930,13 +964,21 @@ def get_transforms(
         static_sup = training and fewshot_static and (save_sup_masks_dir is not None)
         if static_sup:
             seq.append(LoadSavedMasksD(keys=["label"], id_key="id", dir_path=save_sup_masks_dir))
+        # Load per-voxel label source masks (Graph LP reliability) after orientation
+        if training and label_source_dir:
+            seq.append(LoadLabelSourceD(keys=["label"], id_key="id", dir_path=label_source_dir))
         if norm_transform is not None:
             seq.append(norm_transform)
         # Only pad during training to support fixed-size crops.
         # For validation, avoid padding labels so evaluation is computed on true FOV only;
         # sliding_window_inference pads internally as needed and returns the original spatial size.
         if training:
-            pad_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
+            base_pad_keys = ["image", "label"]
+            if static_sup:
+                base_pad_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
+            if label_source_dir:
+                base_pad_keys.append("label_source")
+            pad_keys = base_pad_keys
             # Allow optional keys to be absent (e.g., pseudo_label may not exist for sparse points)
             seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi, allow_missing_keys=True))
         # Optional intensity augmentations (training only)
@@ -949,7 +991,12 @@ def get_transforms(
                 ]
             )
         if include_aug:
-            flip_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
+            base_flip_keys = ["image", "label"]
+            if static_sup:
+                base_flip_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
+            if label_source_dir:
+                base_flip_keys.append("label_source")
+            flip_keys = base_flip_keys
             seq.extend([
                 RandFlipd(keys=flip_keys, spatial_axis=0, prob=0.5, allow_missing_keys=True),
                 RandFlipd(keys=flip_keys, spatial_axis=1, prob=0.5, allow_missing_keys=True),
@@ -957,11 +1004,21 @@ def get_transforms(
             ])
         if include_crop:
             if fg_crop_prob > 0.0 and training:
-                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
+                base_crop_keys = ["image", "label"]
+                if static_sup:
+                    base_crop_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
+                if label_source_dir:
+                    base_crop_keys.append("label_source")
+                crop_keys = base_crop_keys
                 # Custom crop transform already tolerates missing keys
                 seq.append(FGBiasedCropD(keys=crop_keys, roi_size=roi, prob=fg_crop_prob, margin=fg_crop_margin))
             else:
-                crop_keys = ["image", "label", "sup_mask", "seed_mask", "pseudo_label", "valid_mask"] if static_sup else ["image", "label"]
+                base_crop_keys = ["image", "label"]
+                if static_sup:
+                    base_crop_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
+                if label_source_dir:
+                    base_crop_keys.append("label_source")
+                crop_keys = base_crop_keys
                 seq.append(RandSpatialCropd(keys=crop_keys, roi_size=roi, random_size=False, allow_missing_keys=True))
         return seq
 
@@ -1134,6 +1191,63 @@ def dice_loss_masked(logits: torch.Tensor, target: torch.Tensor, ignore_mask: to
     denom = torch.sum(probs * mask + gt_onehot * mask, dim=(0, 2, 3, 4))
     dice_per_class = (2 * inter + eps) / (denom + eps)
     loss = 1.0 - dice_per_class.mean()
+    return loss
+
+
+def dice_loss_masked_weighted(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    ignore_mask: torch.Tensor,
+    weight_map: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Dice loss over classes 0..4 with per-voxel weights.
+
+    - logits: (B,C,X,Y,Z) with C=5
+    - target: (B,1,X,Y,Z) int labels in [0..6]
+    - ignore_mask: (B,1,X,Y,Z) bool, True where labels are valid (label != 6)
+    - weight_map: (B,1,X,Y,Z) float weights; voxels with zero weight are ignored.
+    """
+    probs = F.softmax(logits, dim=1)  # (B,5,X,Y,Z)
+    target_clamped = torch.clamp(target, 0, 4).long()
+    gt_oh = F.one_hot(target_clamped.squeeze(1), num_classes=5)  # (B,X,Y,Z,5)
+    gt_onehot = gt_oh.permute(0, 4, 1, 2, 3).to(probs.dtype)  # (B,5,X,Y,Z)
+
+    # Combined mask incorporates ignore_mask and weights
+    mask = ignore_mask.float() * weight_map.float()  # (B,1,X,Y,Z)
+    mask = mask.expand(-1, 5, -1, -1, -1)  # (B,5,X,Y,Z)
+
+    inter = torch.sum(probs * gt_onehot * mask, dim=(0, 2, 3, 4))
+    denom = torch.sum(probs * mask + gt_onehot * mask, dim=(0, 2, 3, 4))
+    dice_per_class = (2 * inter + eps) / (denom + eps)
+    loss = 1.0 - dice_per_class.mean()
+    return loss
+
+
+def cross_entropy_with_voxel_weights(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    weight_map: torch.Tensor,
+    ignore_index: int = 255,
+) -> torch.Tensor:
+    """Per-voxel weighted cross-entropy.
+
+    - logits: (B,C,X,Y,Z)
+    - target: (B,1,X,Y,Z) with ignore_index marking invalid voxels
+    - weight_map: (B,1,X,Y,Z) float weights; voxels with zero weight are ignored.
+    """
+    # Flatten target to (B,X,Y,Z)
+    target_flat = target.squeeze(1)
+    ce_map = F.cross_entropy(logits, target_flat, reduction="none")  # (B,X,Y,Z)
+
+    # Zero out ignored voxels
+    valid = (target_flat != ignore_index)
+    weights = weight_map.squeeze(1)
+    weights = torch.where(valid, weights, torch.zeros_like(weights))
+    if float(weights.sum().item()) == 0.0:
+        return torch.tensor(0.0, device=logits.device, dtype=logits.dtype)
+
+    loss = (ce_map * weights).sum() / weights.sum()
     return loss
 
 
@@ -1860,11 +1974,24 @@ def train(args):
         fp_seed_strategy=args.fp_seed_strategy,
         fp_no_overlap=args.fp_no_overlap,
         save_sup_masks_dir=save_masks_dir,
+        label_source_dir=getattr(args, "train_label_source_dir", None) or None,
     )
     ds_train = Dataset(train_list, transform=t_train)
-    dl_train = DataLoader(ds_train, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
+    dl_train = DataLoader(
+        ds_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
     ds_test = Dataset(test_list, transform=t_val)
-    dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
+    dl_test = DataLoader(
+        ds_test,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
 
     # Model (require bundle architecture if provided)
     if args.bundle_dir:
@@ -1930,6 +2057,21 @@ def train(args):
             img = batch["image"].to(device)
             lbl = batch["label"].long().to(device)  # (B,1,...)
             ignore_mask = (lbl != 6)
+
+            # Optional per-voxel reliability weights from Graph LP source masks.
+            # Only used in standard few_samples mode; ignored for few_points/few_slices.
+            use_source_weights = (
+                getattr(args, "train_label_source_dir", "") != ""
+                and args.fewshot_mode == "few_samples"
+                and ("label_source" in batch)
+            )
+            if use_source_weights:
+                src = batch["label_source"].to(device).float()  # (B,1,X,Y,Z)
+                w_gt = float(getattr(args, "source_weight_gt", 1.0))
+                w_lp = float(getattr(args, "source_weight_lp", 1.0))
+                label_source_weights = torch.where(src > 0.5, w_gt, w_lp)
+            else:
+                label_source_weights = None
 
             # Supervision masks
             if args.fewshot_mode == "few_points":
@@ -2002,7 +2144,18 @@ def train(args):
             supervised_count = int((ce_target_seed != 255).sum().item())
             ce_sup = torch.tensor(0.0, device=device)
             if supervised_count > 0:
-                ce_sup = F.cross_entropy(logits, ce_target_seed, ignore_index=255)
+                if label_source_weights is not None:
+                    # Restrict weights to supervised voxels
+                    w_sup = label_source_weights.clone()
+                    w_sup[(~seed_mask) | (lbl == 6)] = 0.0
+                    ce_sup = cross_entropy_with_voxel_weights(
+                        logits=logits,
+                        target=ce_target_seed.unsqueeze(1),
+                        weight_map=w_sup,
+                        ignore_index=255,
+                    )
+                else:
+                    ce_sup = F.cross_entropy(logits, ce_target_seed, ignore_index=255)
 
             # Pseudo supervision on dilated region using propagated labels (lower weight)
             ce_pseudo = torch.tensor(0.0, device=device)
@@ -2035,7 +2188,11 @@ def train(args):
             if supervised_count == 0:
                 dice = torch.tensor(0.0, device=device)
             else:
-                dice = dice_loss_masked(logits, lbl, ignore_mask & seed_mask)
+                if label_source_weights is not None:
+                    w_dice = label_source_weights * seed_mask.float()
+                    dice = dice_loss_masked_weighted(logits, lbl, ignore_mask & seed_mask, w_dice)
+                else:
+                    dice = dice_loss_masked(logits, lbl, ignore_mask & seed_mask)
             loss = 0.5 * ce + 0.5 * dice
             if supervised_count == 0 and pl_count == 0:
                 loss = loss + 0.0 * logits.sum()
@@ -2232,7 +2389,17 @@ def parse_args(argv: List[str] | None = None):
              "Supports .npy and .nii formats. If not specified, uses original GT labels. "
              "Example: /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted",
     )
-    p.add_argument("--epochs", type=int, default=20)
+    p.add_argument(
+        "--train_label_source_dir",
+        type=str,
+        default="",
+        help=(
+            "[Optional] Directory with per-voxel label source masks (e.g., Graph LP reliability) "
+            "saved as <id>_source.npy; used to weight loss between SVs with GT-derived seeds and "
+            "purely graph-propagated SVs in few_samples mode."
+        ),
+    )
+    p.add_argument("--epochs", type=int, default=30)
     p.add_argument("--batch_size", type=int, default=2)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for scratch training (Novograd/Adam)")
@@ -2292,6 +2459,18 @@ def parse_args(argv: List[str] | None = None):
     p.add_argument("--global_budget", action="store_true", default=True, help="Enforce fewshot_ratio globally across the entire train set (seed budget)")
     p.add_argument("--seed_bg_frac", type=float, default=0.10, help="Global seed budget fraction reserved for background (class 0)")
     p.add_argument("--pseudo_weight", type=float, default=0.3, help="Loss weight for propagated labels in dilated regions (pseudo supervision)")
+    p.add_argument(
+        "--source_weight_gt",
+        type=float,
+        default=1.0,
+        help="Per-voxel loss weight for SVs whose labels are directly supported by GT seeds (label_source=1).",
+    )
+    p.add_argument(
+        "--source_weight_lp",
+        type=float,
+        default=1.0,
+        help="Per-voxel loss weight for SVs labeled purely via graph propagation (label_source=0).",
+    )
     # Few-shot fixed-budget control
     p.add_argument("--fewshot_static", action="store_true", help="Use a fixed per-volume supervision mask (precomputed once) for few_points mode")
     # Debug/testing flags

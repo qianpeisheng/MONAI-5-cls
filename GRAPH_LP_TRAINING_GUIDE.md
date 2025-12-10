@@ -59,13 +59,17 @@ runs/graph_lp_prop_0p1pct_k10_a0.9/
 ├── cases/
 │   ├── SN13B0_I17_3D_B1_1B250409/
 │   │   ├── propagated_labels.npy          # Dense voxel labels
+│   │   ├── source_mask.npy                # Dense voxel reliability mask (1=SV had GT seed, 0=Graph-only)
 │   │   ├── sparse_sv_labels.json          # Input sparse labels (copy)
 │   │   └── propagation_meta.json          # Statistics
 │   └── ... (380 cases total)
 ├── labels/
-│   ├── SN13B0_I17_3D_B1_1B250409_labels.npy  # Symlink for training
+│   ├── SN13B0_I17_3D_B1_1B250409_labels.npy   # Symlink for training labels
 │   └── ... (380 files)
-└── propagation_summary.json               # Overall statistics
+├── source_masks/
+│   ├── SN13B0_I17_3D_B1_1B250409_source.npy   # Symlink for reliability mask
+│   └── ... (380 files)
+└── propagation_summary.json                   # Overall statistics
 ```
 
 ### Expected Time
@@ -106,6 +110,9 @@ python3 train_finetune_wp5.py \
   --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
   --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
   --train_label_override_dir runs/graph_lp_prop_0p1pct_k10_a0.9/labels \
+  --train_label_source_dir runs/graph_lp_prop_0p1pct_k10_a0.9/source_masks \
+  --source_weight_gt 1.0 \
+  --source_weight_lp 0.5 \
   --output_dir runs/train_graph_lp_k10_a0.9_0p1pct \
   --epochs 20 \
   --batch_size 2 \
@@ -122,6 +129,9 @@ python3 train_finetune_wp5.py \
 | Argument | Value | Explanation |
 |----------|-------|-------------|
 | `--train_label_override_dir` | Path to propagated labels | **Critical:** Uses Graph LP labels instead of GT |
+| `--train_label_source_dir` | Path to source masks | Per-voxel reliability (1=SV had GT seed, 0=Graph-only) |
+| `--source_weight_gt` | 1.0 | Loss weight for GT-supported SVs |
+| `--source_weight_lp` | 0.5 | Loss weight for Graph-only SVs |
 | `--output_dir` | Training output dir | Checkpoints and logs saved here |
 | `--epochs` | 20 | Standard training duration |
 | `--batch_size` | 2 | Adjust based on GPU memory |

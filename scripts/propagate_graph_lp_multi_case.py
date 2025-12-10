@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Dict
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
+
 import numpy as np
 from tqdm import tqdm
 
@@ -53,6 +55,24 @@ def sv_labels_to_dense(sv_ids: np.ndarray, sv_labels: Dict[int, int]) -> np.ndar
         dense_labels[sv_ids == sv_id] = label
 
     return dense_labels
+
+
+def sv_flags_to_dense(sv_ids: np.ndarray, sv_flags: Dict[int, int]) -> np.ndarray:
+    """
+    Broadcast SV-level binary flags to voxel-level dense array.
+
+    Args:
+        sv_ids: (X, Y, Z) int32, supervoxel IDs
+        sv_flags: Dict {sv_id: 0 or 1}
+
+    Returns:
+        dense_flags: (X, Y, Z) uint8 array with 1 where sv_flags[sv_id]==1, else 0.
+    """
+    dense = np.zeros_like(sv_ids, dtype=np.uint8)
+    for sv_id, flag in sv_flags.items():
+        if flag:
+            dense[sv_ids == sv_id] = 1
+    return dense
 
 
 def propagate_case(
@@ -91,11 +111,14 @@ def propagate_case(
     # Compute SV features (centroids)
     sv_features = compute_sv_centroids(sv_ids, unique_svs)
 
-    # Create sv_labels array with -1 for unlabeled
+    # Create sv_labels array with -1 for unlabeled and a parallel flag array
+    # indicating which SVs had GT-derived labels (from sparse seeds).
     sv_labels_array = np.full(N, -1, dtype=np.int64)
+    sv_has_gt = np.zeros(N, dtype=bool)
     for i, sv_id in enumerate(unique_svs):
         if sv_id in sv_labels_sparse:
             sv_labels_array[i] = sv_labels_sparse[sv_id]
+            sv_has_gt[i] = True
 
     # Run Graph LP
     pred_sv_labels = graph_label_propagation(
@@ -108,9 +131,13 @@ def propagate_case(
     )
 
     # Convert to dense voxel labels
-    pred_sv_labels_dict = {int(unique_svs[i]): int(pred_sv_labels[i])
-                            for i in range(N)}
+    pred_sv_labels_dict = {int(unique_svs[i]): int(pred_sv_labels[i]) for i in range(N)}
     dense_labels = sv_labels_to_dense(sv_ids, pred_sv_labels_dict)
+
+    # Build dense voxelwise source mask: 1 for SVs that had GT-derived seeds,
+    # 0 for SVs labeled purely via Graph LP.
+    sv_source_flags = {int(unique_svs[i]): int(sv_has_gt[i]) for i in range(N)}
+    dense_source_mask = sv_flags_to_dense(sv_ids, sv_source_flags)
 
     # Save outputs
     case_output_dir = output_dir / "cases" / case_id
@@ -118,6 +145,8 @@ def propagate_case(
 
     # Save dense labels
     np.save(case_output_dir / "propagated_labels.npy", dense_labels)
+    # Save dense source mask (uint8: 1=seed-supported SV, 0=Graph-only SV)
+    np.save(case_output_dir / "source_mask.npy", dense_source_mask.astype(np.uint8))
 
     # Save sparse labels (copy for reference)
     with open(case_output_dir / "sparse_sv_labels.json", 'w') as f:
@@ -131,6 +160,10 @@ def propagate_case(
         "k": k,
         "alpha": alpha,
         "sv_ids_shape": list(sv_ids.shape),
+        "n_sv_with_gt": int(sv_has_gt.sum()),
+        "n_sv_graph_only": int(N - sv_has_gt.sum()),
+        "voxels_with_gt_seed_support": int(dense_source_mask.sum()),
+        "voxels_graph_only": int(dense_source_mask.size - int(dense_source_mask.sum())),
     }
 
     with open(case_output_dir / "propagation_meta.json", 'w') as f:
@@ -145,9 +178,12 @@ def create_training_symlinks(output_dir: Path, cases: list):
 
     Structure:
         labels/<case_id>_labels.npy -> ../cases/<case_id>/propagated_labels.npy
+        source_masks/<case_id>_source.npy -> ../cases/<case_id>/source_mask.npy
     """
     labels_dir = output_dir / "labels"
     labels_dir.mkdir(parents=True, exist_ok=True)
+    source_dir = output_dir / "source_masks"
+    source_dir.mkdir(parents=True, exist_ok=True)
 
     for case_id in cases:
         # Source: cases/<case_id>/propagated_labels.npy
@@ -163,9 +199,19 @@ def create_training_symlinks(output_dir: Path, cases: list):
                 dst.unlink()
             dst.symlink_to(rel_src)
 
-    print(f"\nCreated training directory: {labels_dir}/")
+        # Source mask symlink (if present)
+        src_mask = output_dir / "cases" / case_id / "source_mask.npy"
+        dst_mask = source_dir / f"{case_id}_source.npy"
+        if src_mask.exists():
+            rel_mask = Path("..") / "cases" / case_id / "source_mask.npy"
+            if dst_mask.exists() or dst_mask.is_symlink():
+                dst_mask.unlink()
+            dst_mask.symlink_to(rel_mask)
+
+    print(f"\nCreated training directory: {labels_dir}/ and source masks: {source_dir}/")
     n_files = len(list(labels_dir.glob("*.npy")))
-    print(f"  {n_files} label files")
+    n_masks = len(list(source_dir.glob("*.npy")))
+    print(f"  {n_files} label files, {n_masks} source masks")
 
 
 def main():
@@ -184,6 +230,8 @@ def main():
                        help="Number of classes (default: 5)")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed (default: 42)")
+    parser.add_argument("--num_workers", type=int, default=1,
+                        help="Number of parallel workers over cases (default: 1 = serial)")
 
     args = parser.parse_args()
 
@@ -202,12 +250,49 @@ def main():
 
     print(f"Found {len(cases)} cases with sparse labels")
 
-    # Process all cases
+    # Process all cases (optionally in parallel)
     all_meta = []
-    for case_id in tqdm(cases, desc="Processing cases"):
-        meta = propagate_case(case_id, sv_dir, seeds_dir, output_dir, args.k, args.alpha, args.num_classes)
-        if meta:
-            all_meta.append(meta)
+    num_workers = max(int(args.num_workers), 1)
+    num_workers = min(num_workers, len(cases)) if cases else 0
+
+    if num_workers <= 1:
+        for case_id in tqdm(cases, desc="Processing cases"):
+            meta = propagate_case(
+                case_id=case_id,
+                sv_dir=sv_dir,
+                seeds_dir=seeds_dir,
+                output_dir=output_dir,
+                k=args.k,
+                alpha=args.alpha,
+                num_classes=args.num_classes,
+            )
+            if meta:
+                all_meta.append(meta)
+    else:
+        print(f"Using {num_workers} workers over {len(cases)} cases")
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            futures = {
+                ex.submit(
+                    propagate_case,
+                    case_id,
+                    sv_dir,
+                    seeds_dir,
+                    output_dir,
+                    args.k,
+                    args.alpha,
+                    args.num_classes,
+                ): case_id
+                for case_id in cases
+            }
+            for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing cases"):
+                cid = futures[fut]
+                try:
+                    meta = fut.result()
+                except Exception as e:
+                    print(f"ERROR processing {cid}: {e}")
+                    continue
+                if meta:
+                    all_meta.append(meta)
 
     # Create training symlinks
     if all_meta:
