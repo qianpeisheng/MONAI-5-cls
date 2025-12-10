@@ -1,0 +1,28 @@
+# Default settings for simple supervoxel + intra-SV fill baseline
+# These are safe defaults for 256^3-ish volumes on CPU.
+
+output_root: data/pseudo/sv_fill
+
+supervoxels:
+  algorithm: slic
+  n_segments: 10000
+  compactness: 0.05
+  sigma: 0.5
+  downsample: 1
+  enforce_connectivity: true
+
+seeds:
+  # Values in seed labels considered unlabeled/ignored during majority vote
+  unlabeled_values: [-1, 6]
+  # Classes to ignore when deriving seed labels from pseudolabels (WP5: ignore 6)
+  ignore_classes: [6]
+  # Tie-breaking policy when multiple classes tie within an SV
+  tie_policy: skip  # one of: skip, min, max, prefer_foreground
+  output_unlabeled_value: 6
+
+io:
+  image_ext_priority: [".nii.gz", ".nii", ".npy"]
+
+run:
+  workers: 4
+  seed: 42
