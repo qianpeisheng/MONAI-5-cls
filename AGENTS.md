@@ -452,8 +452,8 @@ json.dump([train[i] for i in few], open('datalist_train_1pct.json','w'), indent=
 
 ### Run/Log Folder Policy (local convention)
 - Training stdout/stderr should be written inside the run’s own folder (the same folder that contains checkpoints and metrics), typically as `train.log`.
-- Evaluation/inference stdout/stderr should be written inside the corresponding `*_eval` folder (the same folder that contains `metrics/summary.json` and optional `preds/`), typically as `eval.log`.
-- For re-evaluations, reuse the original run folder name and append `_eval` (do not append timestamps). Overwrite `metrics/summary.json` when re-running.
+- Evaluation/inference stdout/stderr should also be written **inside the same run folder** as the experiment, typically as `eval.log` next to `train.log`.
+- For re-evaluations, reuse the original run folder and allow `metrics/summary.json` to be overwritten when re-running.
 
 ## Pitfalls
 - Ignoring class 6: ensure consistency across loss and metrics.
@@ -943,11 +943,11 @@ Troubleshooting
   - `--datalist`: `datalist_train.json` (train split recommended for this folder).
   - Policy: evaluate classes 0..4; ignore voxels with `gt==6`; both‑empty=1.0; optional HD95 with `--heavy --hd_percentile 95`.
 - Parallel run (train split):
-  - `python3 scripts/eval_sv_voted_wp5.py --sv-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted --sv-ids-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2 --datalist datalist_train.json --output_dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted_eval --ignore-class 6 --num_workers 8 --progress --log_to_file`
-- Outputs:
+  - `python3 scripts/eval_sv_voted_wp5.py --sv-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted --sv-ids-dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2 --datalist datalist_train.json --output_dir /home/peisheng/MONAI/runs/sv_fullgt_5k_ras2_voted --ignore-class 6 --num_workers 8 --progress --log_to_file`
+- Outputs (all under the same run folder passed as `--output_dir`):
   - `metrics/per_case.csv` — per-case Dice/IoU (and optional HD/ASD) for classes 0..4 + voxel accuracy.
   - `metrics/summary.json` — dataset averages and (if `--sv-ids-dir` provided) SV diagnostics: mean and voxel‑weighted mean normalized entropy, purity, and entropy fractions at 0.3/0.5.
-  - `eval.log` — tee of stdout/stderr inside the eval folder.
+  - `eval.log` — tee of stdout/stderr inside the run folder.
   - Console also prints the dataset‑level entropy means after Dice/IoU.
 
 ## Evaluation & Metrics (official)

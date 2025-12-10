@@ -191,7 +191,13 @@ def main():
     test_list = load_test_list(args)
     _, t_val = tfw.get_transforms(roi=(args.roi_x, args.roi_y, args.roi_z), norm=args.norm)
     ds_test = Dataset(test_list, transform=t_val)
-    dl_test = DataLoader(ds_test, batch_size=1, shuffle=False, num_workers=args.num_workers)
+    dl_test = DataLoader(
+        ds_test,
+        batch_size=1,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+    )
 
     # Model and checkpoint
     net = build_model(args).to(device)
