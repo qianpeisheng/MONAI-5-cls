@@ -105,14 +105,14 @@ def main() -> None:
     p.add_argument(
         "--lp_num_workers",
         type=int,
-        default=1,
-        help="Number of parallel workers for Graph LP over cases (default: 1).",
+        default=16,
+        help="Number of parallel workers for Graph LP over cases (default: 16).",
     )
     p.add_argument(
         "--eval_num_workers",
         type=int,
-        default=8,
-        help="Number of parallel workers for evaluation (default: 8).",
+        default=16,
+        help="Number of parallel workers for evaluation (default: 16).",
     )
     p.add_argument(
         "--eval_heavy",
@@ -134,6 +134,14 @@ def main() -> None:
         "--eval_log_to_file",
         action="store_true",
         help="If set, tee evaluation logs to eval.log in the eval output dir.",
+    )
+    p.add_argument(
+        "--use_outer_bg_split",
+        action="store_true",
+        help=(
+            "If set, propagate_graph_lp_multi_case will run LP only on ROI SVs "
+            "and force outer-background SVs to label 0 (requires seeds_meta with outer_bg_sv_ids)."
+        ),
     )
 
     args = p.parse_args()
@@ -165,6 +173,8 @@ def main() -> None:
         "--num_workers",
         str(args.lp_num_workers),
     ]
+    if args.use_outer_bg_split:
+        cmd_lp.append("--use_outer_bg_split")
     _run(cmd_lp, "STEP 1: Graph LP propagation over supervoxels")
 
     # Step 2: Evaluate propagated labels vs GT

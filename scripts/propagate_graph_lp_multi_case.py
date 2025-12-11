@@ -83,6 +83,7 @@ def propagate_case(
     k: int,
     alpha: float,
     num_classes: int = 5,
+    use_outer_bg_split: bool = False,
 ) -> Dict:
     """Process one case: load sparse labels, propagate with Graph LP, save."""
 
@@ -108,35 +109,78 @@ def propagate_case(
 
     n_labeled = len(sv_labels_sparse)
 
-    # Compute SV features (centroids)
-    sv_features = compute_sv_centroids(sv_ids, unique_svs)
+    # Optional outer background SVs (taken from seeds_meta, if available).
+    outer_bg_sv_ids = set()
+    if use_outer_bg_split:
+        seeds_meta_path = seeds_dir / f"{case_id}_seeds_meta.json"
+        if not seeds_meta_path.exists():
+            raise RuntimeError(
+                f"outer_bg_split requested but seeds meta not found for case {case_id}: "
+                f"{seeds_meta_path}"
+            )
+        with open(seeds_meta_path) as f:
+            seeds_meta = json.load(f)
+        outer_ids = seeds_meta.get("outer_bg_sv_ids", None)
+        if outer_ids is None:
+            raise RuntimeError(
+                f"seeds_meta for case {case_id} does not contain 'outer_bg_sv_ids'; "
+                "re-run sampling with outer background enabled."
+            )
+        outer_bg_sv_ids = {int(s) for s in outer_ids}
 
-    # Create sv_labels array with -1 for unlabeled and a parallel flag array
-    # indicating which SVs had GT-derived labels (from sparse seeds).
-    sv_labels_array = np.full(N, -1, dtype=np.int64)
-    sv_has_gt = np.zeros(N, dtype=bool)
-    for i, sv_id in enumerate(unique_svs):
-        if sv_id in sv_labels_sparse:
-            sv_labels_array[i] = sv_labels_sparse[sv_id]
-            sv_has_gt[i] = True
+    # Determine ROI vs outer SVs.
+    if outer_bg_sv_ids:
+        roi_mask = np.array([sv_id not in outer_bg_sv_ids for sv_id in unique_svs], dtype=bool)
+    else:
+        roi_mask = np.ones_like(unique_svs, dtype=bool)
 
-    # Run Graph LP
-    pred_sv_labels = graph_label_propagation(
-        sv_features,
-        sv_labels_array,
-        num_classes,
-        k=k,
-        alpha=alpha,
-        sigma=None,  # Use median heuristic
-    )
+    roi_svs = unique_svs[roi_mask]
+    N_roi = len(roi_svs)
+
+    # Compute SV features (centroids) for all SVs, then restrict to ROI.
+    sv_features_all = compute_sv_centroids(sv_ids, unique_svs)
+    sv_features = sv_features_all[roi_mask] if N_roi > 0 else sv_features_all[:0]
+
+    # Create sv_labels array for ROI with -1 for unlabeled and a parallel flag
+    # array indicating which SVs had GT-derived labels (from sparse seeds).
+    sv_labels_array = np.full(N_roi, -1, dtype=np.int64)
+    for i, sv_id in enumerate(roi_svs):
+        if int(sv_id) in sv_labels_sparse:
+            sv_labels_array[i] = sv_labels_sparse[int(sv_id)]
+
+    # Track GT-supported SVs over *all* SVs for source masks.
+    sv_has_gt_all = np.array([int(sv_id) in sv_labels_sparse for sv_id in unique_svs], dtype=bool)
+
+    # Run Graph LP only on ROI SVs; outer background SVs are later forced to 0.
+    if N_roi > 0:
+        pred_sv_labels_roi = graph_label_propagation(
+            sv_features,
+            sv_labels_array,
+            num_classes,
+            k=k,
+            alpha=alpha,
+            sigma=None,  # Use median heuristic
+        )
+    else:
+        pred_sv_labels_roi = np.zeros((0,), dtype=np.int64)
+
+    # Combine ROI predictions with fixed outer background labels.
+    pred_sv_labels_dict = {}
+    for i, sv_id in enumerate(roi_svs):
+        pred_sv_labels_dict[int(sv_id)] = int(pred_sv_labels_roi[i])
+
+    # Any SV not in ROI (outer background) is set to background label 0.
+    for sv_id in unique_svs:
+        sv_id_int = int(sv_id)
+        if sv_id_int not in pred_sv_labels_dict:
+            pred_sv_labels_dict[sv_id_int] = 0
 
     # Convert to dense voxel labels
-    pred_sv_labels_dict = {int(unique_svs[i]): int(pred_sv_labels[i]) for i in range(N)}
     dense_labels = sv_labels_to_dense(sv_ids, pred_sv_labels_dict)
 
     # Build dense voxelwise source mask: 1 for SVs that had GT-derived seeds,
     # 0 for SVs labeled purely via Graph LP.
-    sv_source_flags = {int(unique_svs[i]): int(sv_has_gt[i]) for i in range(N)}
+    sv_source_flags = {int(unique_svs[i]): int(sv_has_gt_all[i]) for i in range(N)}
     dense_source_mask = sv_flags_to_dense(sv_ids, sv_source_flags)
 
     # Save outputs
@@ -160,11 +204,19 @@ def propagate_case(
         "k": k,
         "alpha": alpha,
         "sv_ids_shape": list(sv_ids.shape),
-        "n_sv_with_gt": int(sv_has_gt.sum()),
-        "n_sv_graph_only": int(N - sv_has_gt.sum()),
+        "n_sv_with_gt": int(sv_has_gt_all.sum()),
+        "n_sv_graph_only": int(N - sv_has_gt_all.sum()),
         "voxels_with_gt_seed_support": int(dense_source_mask.sum()),
         "voxels_graph_only": int(dense_source_mask.size - int(dense_source_mask.sum())),
     }
+    if outer_bg_sv_ids:
+        meta.update(
+            {
+                "use_outer_bg_split": True,
+                "n_outer_bg_svs": int(len(outer_bg_sv_ids)),
+                "n_roi_svs": int(N_roi),
+            }
+        )
 
     with open(case_output_dir / "propagation_meta.json", 'w') as f:
         json.dump(meta, f, indent=2)
@@ -232,6 +284,14 @@ def main():
                        help="Random seed (default: 42)")
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Number of parallel workers over cases (default: 1 = serial)")
+    parser.add_argument(
+        "--use_outer_bg_split",
+        action="store_true",
+        help=(
+            "If set, use outer-background partition from *_seeds_meta.json to "
+            "run Graph LP only on ROI SVs and force outer SVs to background."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -265,6 +325,7 @@ def main():
                 k=args.k,
                 alpha=args.alpha,
                 num_classes=args.num_classes,
+                use_outer_bg_split=args.use_outer_bg_split,
             )
             if meta:
                 all_meta.append(meta)
@@ -281,6 +342,7 @@ def main():
                     args.k,
                     args.alpha,
                     args.num_classes,
+                    args.use_outer_bg_split,
                 ): case_id
                 for case_id in cases
             }

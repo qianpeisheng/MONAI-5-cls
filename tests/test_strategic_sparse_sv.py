@@ -25,6 +25,8 @@ try:
     from sample_strategic_sv_seeds import (
         compute_gradient_magnitude,
         sample_strategic_seeds,
+        # New helper for spatial partitioning
+        partition_supervoxels_by_distance,
     )
     from propagate_sv_labels_multi_k import (
         compute_sv_centroids,
@@ -170,6 +172,79 @@ class TestStrategicSampling:
         # Most seeds should be near boundary
         assert boundary_seeds >= len(seed_coords) * 0.5, \
             f"Only {boundary_seeds}/{len(seed_coords)} seeds near boundary"
+
+    def test_partition_supervoxels_outer_background(self):
+        """Test that partition_supervoxels_by_distance splits FG, boundary BG, and outer BG."""
+        # 1D-like line of 10 SVs along x, each voxel its own SV.
+        sv_ids = np.arange(10, dtype=np.int32).reshape(10, 1, 1)
+
+        # Foreground in the center (x=4,5), background elsewhere.
+        gt_labels = np.zeros((10, 1, 1), dtype=np.int16)
+        gt_labels[4:6, 0, 0] = 1
+
+        # Distance threshold so immediate neighbors (dist=1) are boundary,
+        # anything farther is outer background.
+        d_outer = 1.5
+
+        fg_svs, boundary_bg_svs, outer_bg_svs = partition_supervoxels_by_distance(
+            sv_ids=sv_ids,
+            gt_labels=gt_labels,
+            outer_bg_distance=d_outer,
+        )
+
+        # Center SVs should be foreground.
+        assert fg_svs == {4, 5}
+
+        # Immediate neighbors should be boundary background.
+        assert 3 in boundary_bg_svs
+        assert 6 in boundary_bg_svs
+
+        # Far-away SVs should be outer background.
+        for sv_id in [0, 1, 2, 7, 8, 9]:
+            assert sv_id in outer_bg_svs
+
+        # Sets should be disjoint and cover all SVs.
+        all_svs = fg_svs | boundary_bg_svs | outer_bg_svs
+        assert len(all_svs) == 10
+        assert fg_svs.isdisjoint(boundary_bg_svs)
+        assert fg_svs.isdisjoint(outer_bg_svs)
+        assert boundary_bg_svs.isdisjoint(outer_bg_svs)
+
+    def test_sampling_uses_roi_and_respects_boundary_fraction(self):
+        """Test sampling with outer background enabled uses only ROI SVs."""
+        # 10 SVs in a line, with foreground in center as before.
+        sv_ids = np.arange(10, dtype=np.int32).reshape(10, 1, 1)
+        gt_labels = np.zeros((10, 1, 1), dtype=np.int16)
+        gt_labels[4:6, 0, 0] = 1
+
+        image = np.random.rand(10, 1, 1).astype(np.float32)
+
+        # Enable outer background split so that SVs 0,1,2,7,8,9 are auto-BG.
+        d_outer = 1.5
+        budget_ratio = 0.4  # 4 seeds max for 10 voxels
+
+        seed_mask, seed_sv_labels = sample_strategic_seeds(
+            sv_ids=sv_ids,
+            gt_labels=gt_labels,
+            image=image,
+            budget_ratio=budget_ratio,
+            outer_bg_distance=d_outer,
+            boundary_bg_fraction=0.5,  # ~half of seeds for boundary BG
+            gradient_weight=0.0,
+            centroid_weight=0.0,
+        )
+
+        # No seeds should be placed in the far outer background SVs.
+        seeded_svs = set(seed_sv_labels.keys())
+        for sv_id in [0, 1, 2, 7, 8, 9]:
+            assert sv_id not in seeded_svs
+
+        # Seeds should live only in foreground (4,5) and boundary BG (3,6).
+        assert seeded_svs.issubset({3, 4, 5, 6})
+
+        # Budget should still be respected.
+        max_seeds = int(sv_ids.size * budget_ratio)
+        assert seed_mask.sum() <= max_seeds
 
 
 class TestMultiKPropagation:

@@ -38,11 +38,16 @@ The goal is to keep development fast, safe, and incremental:
 This guide orients you (and any agents) to use this MONAI checkout for medical image segmentation on datasets like WP5. It assumes you have data in NIfTI pairs (image/label) using the **new default WP5 dataset layout** at `/data3/wp5_4_Dec_data/3ddl-dataset/data` and a working notebook `mednist_tutorial.ipynb` in this folder.
 
 **Dataset defaults and no‑fallback policy**
-- New default dataset root: `/data3/wp5_4_Dec_data/3ddl-dataset` (contains `data/images`, `data/labels`, `data/metadata.jsonl`, `data/dataset_config.json`, plus `dataset_loader.py`).
-- Training/eval code (`train_finetune_wp5.py`, `scripts/eval_wp5.py`, `scripts/gen_datalists.py`, `scripts/check_split.py`) now use this new layout by default via the external `BumpDataset` loader.
-- The legacy dataset at `/data3/wp5/wp5-code/dataloaders/wp5-dataset` is still supported, but **only when explicitly passed via `--data_root` and `--split_cfg`**.
-- There is **no silent fallback between datasets**: if you point `--data_root`/`--split_cfg` at an invalid or partially‑present new dataset, the code raises a clear error instead of falling back to the legacy layout.
-- If a split/config JSON references serial numbers that are not present (or do not have 3D samples for segmentation), this is explicitly logged as a warning and those serials are ignored for 3D segmentation splits. No alternative dataset layout is used implicitly; fix the config if you need strict 1:1 coverage.
+- **New default dataset (preferred)**  
+  - Root: `/data3/wp5_4_Dec_data/3ddl-dataset` (contains `data/images`, `data/labels`, `data/metadata.jsonl`, `data/dataset_config.json`, plus `dataset_loader.py`).
+  - Training/eval code (`train_finetune_wp5.py`, `scripts/eval_wp5.py`, `scripts/gen_datalists.py`, `scripts/check_split.py`, the new Graph LP / strategic sampling flows) should use this layout by default, typically via **MONAI-style datalists** generated from `dataset_config.json`.
+  - For this new dataset, use `datalist_train_new.json` / `datalist_test_new.json` (or equivalents) as the **single source of truth** for which cases belong to train vs test.  
+  - Do **not** mix the legacy serial-number split config with this new root (e.g., do not pass `/data3/wp5_4_Dec_data/3ddl-dataset/data` together with `/data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_*.json`).
+- **Legacy dataset (kept for reproducing old experiments only)**  
+  - Root: `/data3/wp5/wp5-code/dataloaders/wp5-dataset`.
+  - Only use this when explicitly requested, together with its serial-based `--split_cfg` (e.g., `3ddl_split_config_20250801.json`).
+  - Commands in this file that reference `/data3/wp5/wp5-code/dataloaders/wp5-dataset` are **legacy-only** and must not be combined with paths under `/data3/wp5_4_Dec_data/3ddl-dataset`.
+- There is **no silent fallback between datasets**: do not rely on any implicit switching. Always choose either the new dataset + datalists **or** the legacy dataset + split config for a given run, never both at once.
 
 Key references in this repo:
 - Notebook: `mednist_tutorial.ipynb` (classification tutorial — reuse its env, transforms, and DataLoader patterns)
@@ -709,10 +714,16 @@ bash scripts/run_strategic_sparse_complete.sh --help
 
 If you prefer to run steps separately or need more control:
 
-**Step 1: Strategic Seed Sampling**
+**Step 1 (legacy dataset only): Strategic Seed Sampling**
 
 ```bash
 python3 scripts/sample_strategic_sv_seeds.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --budget_ratio 0.001 --class_weights 0.1,1,1,2,2 --output_dir runs/strategic_seeds_0p1pct --seed 42
+```
+
+For new experiments on the **new default dataset**, use the datalists instead of the legacy `--split_cfg`:
+
+```bash
+python3 scripts/sample_strategic_sv_seeds.py --sv_dir runs/sv_fullgt_slic_n12000_new_ras --data_root /data3/wp5_4_Dec_data/3ddl-dataset/data --datalist datalist_train_new.json --budget_ratio 0.001 --class_weights 0.1,1,1,2,2 --outer_bg_distance 24.0 --boundary_bg_fraction 0.1 --output_dir runs/strategic_sparse_0p1pct_new_outerbg/strategic_seeds --seed 42 --num_workers 16
 ```
 
 **Outputs**:
@@ -723,10 +734,15 @@ python3 scripts/sample_strategic_sv_seeds.py --sv_dir /data3/wp5/monai-sv-sweeps
 
 **Note**: Class weights are `0.1,1,1,2,2` for classes 0,1,2,3,4 respectively. Class 0 (background) gets lower weight (0.1) due to its large proportion and ease of learning.
 
-**Step 2: Multi-k Label Propagation**
-
+**Step 2: Multi-k Label Propagation (legacy example)**  
 ```bash
 python3 scripts/propagate_sv_labels_multi_k.py --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted --seeds_dir runs/strategic_seeds_0p1pct --k_values 1,3,5,7,10,15,20,25,30,50 --output_dir runs/sv_sparse_prop_0p1pct_strategic --seed 42
+```
+
+For Graph LP over SVs on the **new dataset** (single k, ROI-only LP, plus evaluation), prefer the dedicated pipeline:
+
+```bash
+python3 scripts/pipeline_graph_lp_sv.py --sv_dir runs/sv_fullgt_slic_n12000_new_ras --seeds_dir runs/strategic_sparse_0p1pct_new_outerbg/strategic_seeds --datalist datalist_train_new.json --data_root /data3/wp5_4_Dec_data/3ddl-dataset/data --output_dir runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg --k 10 --alpha 0.9 --num_classes 5 --seed 42 --use_outer_bg_split --lp_num_workers 16 --eval_num_workers 16 --eval_progress --eval_log_to_file --eval_heavy
 ```
 
 **Outputs**:

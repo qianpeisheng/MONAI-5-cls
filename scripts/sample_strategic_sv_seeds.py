@@ -33,18 +33,23 @@ from typing import Dict, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
-from scipy.ndimage import sobel
+from scipy.ndimage import sobel, distance_transform_edt
 from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, Orientationd
 from tqdm import tqdm
 
 
 def load_split_cases(split_cfg: str, data_root: Path, split: str = "train") -> list:
-    """Load case IDs from split config.
+    """Load case IDs from legacy split config (serial-based).
 
     Split config format:
         {"test_serial_numbers": [9, 12, 15, ...]}
 
     Train set = all cases except those with serial numbers in test set.
+
+    This helper is intended for the legacy flat WP5 dataset rooted at
+    `/data3/wp5/wp5-code/dataloaders/wp5-dataset`. For the new default dataset
+    under `/data3/wp5_4_Dec_data/3ddl-dataset`, prefer passing a MONAI-style
+    datalist (see --datalist) instead of mixing split_cfg with the new layout.
     """
     import re
     import os
@@ -102,6 +107,69 @@ def compute_gradient_magnitude(image: np.ndarray) -> np.ndarray:
     return np.sqrt(grad_x**2 + grad_y**2 + grad_z**2)
 
 
+def partition_supervoxels_by_distance(
+    sv_ids: np.ndarray,
+    gt_labels: np.ndarray,
+    outer_bg_distance: float,
+):
+    """
+    Partition supervoxels into:
+      - fg_svs: SVs containing any foreground voxel (labels 1-4, excluding 6).
+      - boundary_bg_svs: background SVs within `outer_bg_distance` voxels of FG.
+      - outer_bg_svs: background SVs farther than `outer_bg_distance` from FG.
+
+    Args:
+        sv_ids: (X, Y, Z) int32, supervoxel IDs.
+        gt_labels: (X, Y, Z) int16, ground truth labels.
+        outer_bg_distance: distance threshold in voxels.
+
+    Returns:
+        (fg_svs, boundary_bg_svs, outer_bg_svs) as sets of SV IDs (ints).
+    """
+    if outer_bg_distance <= 0:
+        raise ValueError("outer_bg_distance must be > 0 for partitioning.")
+
+    # Foreground mask: valid foreground classes 1-4, excluding ignore (6).
+    fg_mask = (gt_labels > 0) & (gt_labels != 6)
+
+    unique_svs = np.unique(sv_ids)
+    fg_svs = set()
+    boundary_bg_svs = set()
+    outer_bg_svs = set()
+
+    if not np.any(fg_mask):
+        # Degenerate case: no foreground at all – treat all as outer BG.
+        outer_bg_svs = {int(sv_id) for sv_id in unique_svs}
+        return fg_svs, boundary_bg_svs, outer_bg_svs
+
+    # Distance (in voxels) from each non-foreground voxel to nearest foreground voxel.
+    # fg_mask True -> distance 0; ~fg_mask True -> distance to nearest fg voxel.
+    dist_to_fg = distance_transform_edt(~fg_mask)
+
+    for sv_id in unique_svs:
+        sv_id_int = int(sv_id)
+        mask = sv_ids == sv_id
+
+        # Any foreground voxel in this SV?
+        if np.any(fg_mask[mask]):
+            fg_svs.add(sv_id_int)
+            continue
+
+        # Background SV: classify by min distance to foreground.
+        sv_dist = dist_to_fg[mask]
+        if sv_dist.size == 0:
+            outer_bg_svs.add(sv_id_int)
+            continue
+
+        min_dist = float(sv_dist.min())
+        if min_dist > outer_bg_distance:
+            outer_bg_svs.add(sv_id_int)
+        else:
+            boundary_bg_svs.add(sv_id_int)
+
+    return fg_svs, boundary_bg_svs, outer_bg_svs
+
+
 def sample_strategic_seeds(
     sv_ids: np.ndarray,
     gt_labels: np.ndarray,
@@ -111,18 +179,21 @@ def sample_strategic_seeds(
     gradient_weight: float = 1.0,
     centroid_weight: float = 0.5,
     verbose: bool = True,
+    outer_bg_distance: float = 0.0,
+    boundary_bg_fraction: float = 0.1,
 ) -> Tuple[np.ndarray, Dict[int, int]]:
     """
     Strategic seed sampling to maximize supervoxel coverage.
 
-    Algorithm:
-        1. Identify all foreground SVs (containing classes 1-4)
-        2. For each FG SV, score candidate voxels by:
-           - Class priority: rare classes (3, 4) get higher weight
-           - Border proximity: high gradient magnitude
-           - Representativeness: near SV centroid (tie-breaker)
-        3. Select top 1 voxel per SV (highest score)
-        4. Rank all SV candidates globally and select top N within budget
+    If outer_bg_distance > 0, SVs are partitioned into:
+      - foreground SVs (contain any class 1-4 voxel),
+      - boundary background SVs (background close to foreground),
+      - outer background SVs (background far from foreground).
+
+    Seeds are then allocated only within the ROI SVs (foreground + boundary
+    background), with a configurable fraction of the budget reserved for
+    boundary background SVs. Outer background SVs are intended to be labeled
+    as background later without consuming budget.
 
     Args:
         sv_ids: (X, Y, Z) int32, supervoxel IDs
@@ -132,6 +203,11 @@ def sample_strategic_seeds(
         class_weights: Dict of class→weight (default: {0:0.1, 1:1, 2:1, 3:2, 4:2})
         gradient_weight: weight for gradient component (default 1.0)
         centroid_weight: weight for centroid proximity (default 0.5)
+        verbose: enable logging
+        outer_bg_distance: if >0, enable outer-background partitioning with this
+            distance (in voxels) as the threshold between boundary and outer BG.
+        boundary_bg_fraction: fraction of the seed budget to spend on boundary
+            background SVs when outer_bg_distance > 0.
 
     Returns:
         seed_mask: (X, Y, Z) bool, binary mask of sampled voxels
@@ -154,26 +230,150 @@ def sample_strategic_seeds(
     # Precompute gradient magnitude
     grad_mag = compute_gradient_magnitude(image)
 
-    # Score candidates within each supervoxel
-    sv_candidates = []  # List of (sv_id, voxel_coord, score, label)
+    # Legacy behavior: no outer background split, sample over all SVs.
+    use_outer_bg = outer_bg_distance is not None and outer_bg_distance > 0.0
 
-    iterable = tqdm(all_svs, desc="  Scoring candidates", leave=False) if verbose else all_svs
+    if not use_outer_bg:
+        # Score candidates within each supervoxel
+        sv_candidates = []  # List of (sv_id, voxel_coord, score, label)
+
+        iterable = tqdm(all_svs, desc="  Scoring candidates", leave=False) if verbose else all_svs
+        for sv_id in iterable:
+            mask = (sv_ids == sv_id)
+            coords = np.argwhere(mask)
+
+            # Get labels for all voxels in this SV
+            labels = gt_labels[coords[:, 0], coords[:, 1], coords[:, 2]]
+            valid_mask = (labels >= 0) & (labels <= 4)  # Valid classes only
+            if valid_mask.sum() == 0:
+                continue
+
+            labels_valid = labels[valid_mask]
+
+            # Determine dominant class in this SV
+            dominant_class = int(np.bincount(labels_valid).argmax())
+
+            # Only sample voxels of the dominant class (to ensure class representation)
+            class_mask = (labels == dominant_class)
+            if class_mask.sum() == 0:
+                continue
+
+            coords_class = coords[class_mask]
+            labels_class = labels[class_mask]
+
+            # Compute scores for candidate voxels of this class
+            scores = np.zeros(len(coords_class), dtype=float)
+
+            # Component 1: Class priority weight
+            scores += class_weights.get(dominant_class, 0)
+
+            # Component 2: Border proximity (gradient magnitude)
+            gradients = grad_mag[coords_class[:, 0], coords_class[:, 1], coords_class[:, 2]]
+            if gradients.max() > 0:
+                scores += gradient_weight * (gradients / gradients.max())
+
+            # Component 3: Representativeness (distance to centroid, inverted)
+            centroid = coords.mean(axis=0)
+            distances = np.linalg.norm(coords_class - centroid, axis=1)
+            if distances.max() > 0:
+                scores -= centroid_weight * (distances / distances.max())
+
+            # Select best candidate for this SV
+            best_idx = scores.argmax()
+            best_coord = coords_class[best_idx]
+            best_label = labels_class[best_idx]
+            best_score = scores[best_idx]
+
+            sv_candidates.append((int(sv_id), tuple(best_coord), best_score, int(best_label)))
+
+        # Stratified sampling: allocate budget proportionally to class frequency in GT
+        unique_labels, label_counts = np.unique(
+            gt_labels[(gt_labels >= 0) & (gt_labels <= 4)], return_counts=True
+        )
+        class_freq = {int(label): count for label, count in zip(unique_labels, label_counts)}
+        total_freq = sum(class_freq.values())
+
+        # Weight frequencies by class_weights so that foreground and rare
+        # classes receive more of the seed budget (e.g., class 0 has small
+        # weight, classes 3/4 have larger weights).
+        weighted_freq = {
+            cls: class_freq[cls] * class_weights.get(cls, 0.0) for cls in class_freq
+        }
+        total_weighted = sum(weighted_freq.values()) or float(total_freq)
+
+        # Group candidates by class
+        candidates_by_class = {cls: [] for cls in range(5)}
+        for sv_id, coord, score, label in sv_candidates:
+            candidates_by_class[label].append((sv_id, coord, score, label))
+
+        # Allocate budget to each class proportionally
+        selected_candidates = []
+        for cls in range(5):
+            if cls not in class_freq or class_freq[cls] == 0:
+                continue
+
+            # Calculate target number of seeds for this class, using
+            # weighted frequencies to emphasize higher-priority classes.
+            if cls in weighted_freq and weighted_freq[cls] > 0 and total_weighted > 0:
+                class_ratio = weighted_freq[cls] / total_weighted
+            else:
+                class_ratio = class_freq[cls] / total_freq if total_freq > 0 else 0.0
+            class_budget = int(max_seeds * class_ratio)
+
+            # Select top candidates from this class
+            class_candidates = candidates_by_class[cls]
+            class_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score
+            selected_from_class = class_candidates[:class_budget]
+            selected_candidates.extend(selected_from_class)
+
+            if verbose and len(selected_from_class) > 0:
+                print(f"  Class {cls}: {len(selected_from_class):4d} seeds ({class_ratio*100:.1f}% of budget)")
+
+        if verbose:
+            print(f"  Total selected: {len(selected_candidates)} seeds (budget: {max_seeds})")
+
+        # Create seed mask and SV label dict
+        seed_mask = np.zeros_like(sv_ids, dtype=bool)
+        seed_sv_labels = {}
+
+        for sv_id, coord, score, label in selected_candidates:
+            seed_mask[coord] = True
+            seed_sv_labels[sv_id] = label
+
+        return seed_mask, seed_sv_labels
+
+    # New behavior: outer background split enabled.
+    fg_svs, boundary_bg_svs, outer_bg_svs = partition_supervoxels_by_distance(
+        sv_ids=sv_ids,
+        gt_labels=gt_labels,
+        outer_bg_distance=outer_bg_distance,
+    )
+
+    roi_svs = sorted(list(fg_svs | boundary_bg_svs))
+
+    if verbose:
+        print(
+            f"  Partitioned SVs -> fg: {len(fg_svs)}, "
+            f"boundary_bg: {len(boundary_bg_svs)}, outer_bg: {len(outer_bg_svs)}"
+        )
+
+    # Score candidates only within ROI SVs.
+    fg_candidates = []        # (sv_id, coord, score, label)
+    boundary_candidates = []  # (sv_id, coord, score, label)
+
+    iterable = tqdm(roi_svs, desc="  Scoring ROI candidates", leave=False) if verbose else roi_svs
     for sv_id in iterable:
         mask = (sv_ids == sv_id)
         coords = np.argwhere(mask)
 
-        # Get labels for all voxels in this SV
         labels = gt_labels[coords[:, 0], coords[:, 1], coords[:, 2]]
-        valid_mask = (labels >= 0) & (labels <= 4)  # Valid classes only
+        valid_mask = (labels >= 0) & (labels <= 4)
         if valid_mask.sum() == 0:
             continue
 
         labels_valid = labels[valid_mask]
-
-        # Determine dominant class in this SV
         dominant_class = int(np.bincount(labels_valid).argmax())
 
-        # Only sample voxels of the dominant class (to ensure class representation)
         class_mask = (labels == dominant_class)
         if class_mask.sum() == 0:
             continue
@@ -181,63 +381,106 @@ def sample_strategic_seeds(
         coords_class = coords[class_mask]
         labels_class = labels[class_mask]
 
-        # Compute scores for candidate voxels of this class
         scores = np.zeros(len(coords_class), dtype=float)
 
-        # Component 1: Class priority weight
-        scores += class_weights.get(dominant_class, 0)
+        # Class weighting for foreground SVs, lightweight for boundary BG.
+        if sv_id in fg_svs:
+            scores += class_weights.get(dominant_class, 0)
 
-        # Component 2: Border proximity (gradient magnitude)
         gradients = grad_mag[coords_class[:, 0], coords_class[:, 1], coords_class[:, 2]]
         if gradients.max() > 0:
             scores += gradient_weight * (gradients / gradients.max())
 
-        # Component 3: Representativeness (distance to centroid, inverted)
         centroid = coords.mean(axis=0)
         distances = np.linalg.norm(coords_class - centroid, axis=1)
         if distances.max() > 0:
             scores -= centroid_weight * (distances / distances.max())
 
-        # Select best candidate for this SV
         best_idx = scores.argmax()
         best_coord = coords_class[best_idx]
         best_label = labels_class[best_idx]
         best_score = scores[best_idx]
 
-        sv_candidates.append((int(sv_id), tuple(best_coord), best_score, int(best_label)))
+        entry = (int(sv_id), tuple(best_coord), best_score, int(best_label))
+        if sv_id in boundary_bg_svs:
+            boundary_candidates.append(entry)
+        else:
+            fg_candidates.append(entry)
 
-    # Stratified sampling: allocate budget proportionally to class frequency in GT
-    # First, compute class distribution in GT
-    unique_labels, label_counts = np.unique(gt_labels[(gt_labels >= 0) & (gt_labels <= 4)], return_counts=True)
-    class_freq = {int(label): count for label, count in zip(unique_labels, label_counts)}
-    total_freq = sum(class_freq.values())
+    # Budget split between foreground and boundary background.
+    boundary_bg_fraction = float(np.clip(boundary_bg_fraction, 0.0, 1.0))
+    target_boundary = int(max_seeds * boundary_bg_fraction)
+    target_fg = max_seeds - target_boundary
 
-    # Group candidates by class
-    candidates_by_class = {cls: [] for cls in range(5)}
-    for sv_id, coord, score, label in sv_candidates:
-        candidates_by_class[label].append((sv_id, coord, score, label))
+    # Clamp to available candidates and reassign any unused budget.
+    target_boundary = min(target_boundary, len(boundary_candidates))
+    target_fg = min(target_fg, len(fg_candidates))
 
-    # Allocate budget to each class proportionally
-    selected_candidates = []
-    for cls in range(5):
-        if cls not in class_freq or class_freq[cls] == 0:
-            continue
+    remaining = max_seeds - (target_boundary + target_fg)
+    if remaining > 0:
+        # Prefer adding more FG seeds if available, then boundary BG.
+        extra_fg = min(remaining, len(fg_candidates) - target_fg)
+        target_fg += extra_fg
+        remaining -= extra_fg
 
-        # Calculate target number of seeds for this class
-        class_ratio = class_freq[cls] / total_freq
-        class_budget = int(max_seeds * class_ratio)
-
-        # Select top candidates from this class
-        class_candidates = candidates_by_class[cls]
-        class_candidates.sort(key=lambda x: x[2], reverse=True)  # Sort by score
-        selected_from_class = class_candidates[:class_budget]
-        selected_candidates.extend(selected_from_class)
-
-        if verbose and len(selected_from_class) > 0:
-            print(f"  Class {cls}: {len(selected_from_class):4d} seeds ({class_ratio*100:.1f}% of budget)")
+        if remaining > 0:
+            extra_boundary = min(remaining, len(boundary_candidates) - target_boundary)
+            target_boundary += extra_boundary
 
     if verbose:
-        print(f"  Total selected: {len(selected_candidates)} seeds (budget: {max_seeds})")
+        print(
+            f"  Seed budget (max {max_seeds}): "
+            f"FG={target_fg}, boundary_bg={target_boundary}, "
+            f"unused={max_seeds - (target_fg + target_boundary)}"
+        )
+
+    # Select foreground seeds with simple class-proportional allocation.
+    selected_candidates = []
+    if target_fg > 0 and fg_candidates:
+        # Compute class distribution over valid GT labels (1-4).
+        valid_gt = gt_labels[(gt_labels >= 0) & (gt_labels <= 4)]
+        unique_labels, label_counts = np.unique(valid_gt, return_counts=True)
+        class_freq = {int(label): count for label, count in zip(unique_labels, label_counts)}
+        total_freq = sum(class_freq.values())
+
+        weighted_freq = {
+            cls: class_freq[cls] * class_weights.get(cls, 0.0) for cls in class_freq
+        }
+        total_weighted = sum(weighted_freq.values()) or float(total_freq)
+
+        candidates_by_class = {cls: [] for cls in range(5)}
+        for sv_id, coord, score, label in fg_candidates:
+            candidates_by_class[label].append((sv_id, coord, score, label))
+
+        for cls in range(5):
+            if cls not in class_freq or class_freq[cls] == 0:
+                continue
+            if cls in weighted_freq and weighted_freq[cls] > 0 and total_weighted > 0:
+                class_ratio = weighted_freq[cls] / total_weighted
+            else:
+                class_ratio = class_freq[cls] / total_freq if total_freq > 0 else 0.0
+            class_budget = int(target_fg * class_ratio)
+            class_candidates = candidates_by_class[cls]
+            class_candidates.sort(key=lambda x: x[2], reverse=True)
+            selected_from_class = class_candidates[:class_budget]
+            selected_candidates.extend(selected_from_class)
+
+    # If we didn't fill the FG budget (due to rounding or missing classes),
+    # top up with remaining best-scoring FG candidates.
+    if fg_candidates and len(selected_candidates) < target_fg:
+        already = {(sv_id, coord) for sv_id, coord, _, _ in selected_candidates}
+        remaining_fg = [c for c in fg_candidates if (c[0], c[1]) not in already]
+        remaining_fg.sort(key=lambda x: x[2], reverse=True)
+        need = target_fg - len(selected_candidates)
+        selected_candidates.extend(remaining_fg[:need])
+
+    # Boundary background seeds: simply take top-scoring candidates.
+    if target_boundary > 0 and boundary_candidates:
+        boundary_candidates.sort(key=lambda x: x[2], reverse=True)
+        selected_candidates.extend(boundary_candidates[:target_boundary])
+
+    if verbose:
+        print(f"  Total selected (ROI): {len(selected_candidates)} seeds (budget: {max_seeds})")
 
     # Create seed mask and SV label dict
     seed_mask = np.zeros_like(sv_ids, dtype=bool)
@@ -257,6 +500,8 @@ def process_case(
     output_dir: Path,
     budget_ratio: float,
     class_weights: Dict[int, float],
+    outer_bg_distance: float = 0.0,
+    boundary_bg_fraction: float = 0.1,
     verbose: bool = True,
 ) -> Dict:
     """Process one case: load data, sample seeds, save outputs."""
@@ -315,9 +560,29 @@ def process_case(
     gt_labels = data["label"][0].numpy().astype(np.int16)  # Remove channel dim
     image = data["image"][0].numpy().astype(np.float32)
 
+    # Optional outer background partitioning (for metadata).
+    fg_svs = set()
+    boundary_bg_svs = set()
+    outer_bg_svs = set()
+    if outer_bg_distance is not None and outer_bg_distance > 0.0:
+        fg_svs, boundary_bg_svs, outer_bg_svs = partition_supervoxels_by_distance(
+            sv_ids=sv_ids,
+            gt_labels=gt_labels,
+            outer_bg_distance=outer_bg_distance,
+        )
+
     # Sample seeds
     seed_mask, seed_sv_labels = sample_strategic_seeds(
-        sv_ids, gt_labels, image, budget_ratio, class_weights, verbose=verbose
+        sv_ids=sv_ids,
+        gt_labels=gt_labels,
+        image=image,
+        budget_ratio=budget_ratio,
+        class_weights=class_weights,
+        gradient_weight=1.0,
+        centroid_weight=0.5,
+        verbose=verbose,
+        outer_bg_distance=outer_bg_distance,
+        boundary_bg_fraction=boundary_bg_fraction,
     )
 
     # Compute statistics
@@ -339,6 +604,18 @@ def process_case(
         "budget_used": budget_ratio,
         "sv_ids_shape": list(sv_ids.shape),
     }
+    # Optional region stats for outer-background-aware runs.
+    if outer_bg_distance is not None and outer_bg_distance > 0.0:
+        meta.update(
+            {
+                "outer_bg_distance": float(outer_bg_distance),
+                "boundary_bg_fraction": float(boundary_bg_fraction),
+                "n_fg_svs": int(len(fg_svs)),
+                "n_boundary_bg_svs": int(len(boundary_bg_svs)),
+                "n_outer_bg_svs": int(len(outer_bg_svs)),
+                "outer_bg_sv_ids": [int(s) for s in sorted(outer_bg_svs)],
+            }
+        )
 
     # Save outputs
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -354,9 +631,20 @@ def process_case(
     return meta
 
 
-def _process_case_worker(payload: Tuple[str, str, str, str, float, Dict[int, float]]) -> Dict:
+def _process_case_worker(
+    payload: Tuple[str, str, str, str, float, Dict[int, float], float, float]
+) -> Dict:
     """Wrapper for multiprocessing: payload carries only picklable types."""
-    case_id, sv_dir_str, data_root_str, output_dir_str, budget_ratio, class_weights = payload
+    (
+        case_id,
+        sv_dir_str,
+        data_root_str,
+        output_dir_str,
+        budget_ratio,
+        class_weights,
+        outer_bg_distance,
+        boundary_bg_fraction,
+    ) = payload
     sv_dir = Path(sv_dir_str)
     data_root = Path(data_root_str)
     output_dir = Path(output_dir_str)
@@ -368,6 +656,8 @@ def _process_case_worker(payload: Tuple[str, str, str, str, float, Dict[int, flo
             output_dir=output_dir,
             budget_ratio=budget_ratio,
             class_weights=class_weights,
+            outer_bg_distance=outer_bg_distance,
+            boundary_bg_fraction=boundary_bg_fraction,
             verbose=False,
         )
     except Exception as e:
@@ -381,20 +671,54 @@ def main():
                        help="Directory containing supervoxel IDs (*_sv_ids.npy)")
     parser.add_argument("--data_root", type=str, required=True,
                        help="Root directory containing GT labels and images")
-    parser.add_argument("--split_cfg", type=str, required=True,
-                       help="Split config JSON file")
+    parser.add_argument(
+        "--split_cfg",
+        type=str,
+        default="",
+        help=(
+            "Legacy split config JSON (serial-number based). "
+            "For the new WP5 dataset, prefer --datalist instead."
+        ),
+    )
+    parser.add_argument(
+        "--datalist",
+        type=str,
+        default="",
+        help=(
+            "Optional MONAI-style datalist JSON with records {image,label,id}. "
+            "If provided, overrides --split_cfg and uses the datalist ids as cases."
+        ),
+    )
     parser.add_argument("--split", type=str, default="train",
-                       help="Split to process (default: train)")
+                       help="Split to process (default: train; ignored when --datalist is set)")
     parser.add_argument("--budget_ratio", type=float, default=0.001,
                        help="Fraction of voxels to sample (default: 0.001 = 0.1%%)")
     parser.add_argument("--class_weights", type=str, default="0.1,1,1,2,2",
                        help="Class weights for 0,1,2,3,4 (default: 0.1,1,1,2,2)")
+    parser.add_argument(
+        "--outer_bg_distance",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0, enable outer background split using this distance (voxels) "
+            "to separate boundary vs outer background SVs."
+        ),
+    )
+    parser.add_argument(
+        "--boundary_bg_fraction",
+        type=float,
+        default=0.1,
+        help=(
+            "Fraction of seed budget to allocate to boundary-background SVs "
+            "when outer_bg_distance>0 (default: 0.1)."
+        ),
+    )
     parser.add_argument("--output_dir", type=str, required=True,
                        help="Output directory for seeds and metadata")
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed (default: 42)")
-    parser.add_argument("--num_workers", type=int, default=1,
-                       help="Number of parallel workers (default: 1)")
+    parser.add_argument("--num_workers", type=int, default=16,
+                       help="Number of parallel workers (default: 16)")
 
     args = parser.parse_args()
 
@@ -414,10 +738,32 @@ def main():
     data_root = Path(args.data_root)
     output_dir = Path(args.output_dir)
 
-    cases = load_split_cases(args.split_cfg, data_root, args.split)
+    if args.datalist:
+        # New dataset path: rely on MONAI-style datalist (e.g., datalist_train_new.json)
+        try:
+            recs = json.loads(Path(args.datalist).read_text())
+        except Exception as e:
+            print(f"ERROR: Failed to read datalist '{args.datalist}': {e}")
+            sys.exit(1)
+        cases = sorted({str(rec.get("id")) for rec in recs if rec.get("id")})
+        if not cases:
+            print(f"ERROR: No 'id' entries found in datalist '{args.datalist}'")
+            sys.exit(1)
+        print(f"Using datalist '{args.datalist}' with {len(cases)} cases")
+    else:
+        if not args.split_cfg:
+            print("ERROR: Must provide either --datalist (new dataset) or --split_cfg (legacy dataset).")
+            sys.exit(1)
+        cases = load_split_cases(args.split_cfg, data_root, args.split)
+
     print(f"Processing {len(cases)} cases from {args.split} split")
     print(f"Budget: {args.budget_ratio:.4f} ({args.budget_ratio*100:.2f}%)")
     print(f"Class weights: {class_weights}")
+    if args.outer_bg_distance > 0.0:
+        print(
+            f"Outer background enabled: distance={args.outer_bg_distance}, "
+            f"boundary_bg_fraction={args.boundary_bg_fraction}"
+        )
 
     all_meta = []
     num_workers = max(int(args.num_workers), 1)
@@ -433,6 +779,8 @@ def main():
                 output_dir=output_dir,
                 budget_ratio=args.budget_ratio,
                 class_weights=class_weights,
+                 outer_bg_distance=args.outer_bg_distance,
+                 boundary_bg_fraction=args.boundary_bg_fraction,
                 verbose=True,
             )
             if meta:
@@ -440,7 +788,16 @@ def main():
     else:
         print(f"Using {num_workers} workers over {len(cases)} cases")
         payloads = [
-            (case_id, str(sv_dir), str(data_root), str(output_dir), float(args.budget_ratio), class_weights)
+            (
+                case_id,
+                str(sv_dir),
+                str(data_root),
+                str(output_dir),
+                float(args.budget_ratio),
+                class_weights,
+                float(args.outer_bg_distance),
+                float(args.boundary_bg_fraction),
+            )
             for case_id in cases
         ]
         with ProcessPoolExecutor(max_workers=num_workers) as ex:

@@ -52,6 +52,39 @@ python3 scripts/propagate_graph_lp_multi_case.py \
 | `--output_dir` | Output directory | Where to save propagated labels |
 | `--seed` | 42 | Random seed for reproducibility |
 
+**Optional (outer-background split, tested on n_segments=12000):**
+
+You can speed up Graph LP and make better use of the 0.1% label budget by:
+
+1. Enabling outer-background aware sampling when generating seeds (runs only on SVs near the foreground):
+
+```bash
+python3 scripts/sample_strategic_sv_seeds.py \
+  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
+  --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
+  --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
+  --budget_ratio 0.001 \
+  --outer_bg_distance 24.0 \
+  --boundary_bg_fraction 0.1 \
+  --output_dir runs/strategic_sparse_0p1pct_outerbg/strategic_seeds \
+  --seed 42
+```
+
+2. Running Graph LP only on the ROI SVs (foreground + near-background) and forcing far-background SVs to label 0:
+
+```bash
+python3 scripts/propagate_graph_lp_multi_case.py \
+  --sv_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n12000_c0.05_s1.0_ras2_voted \
+  --seeds_dir runs/strategic_sparse_0p1pct_outerbg/strategic_seeds \
+  --k 10 \
+  --alpha 0.9 \
+  --output_dir runs/graph_lp_prop_0p1pct_k10_a0.9_outerbg \
+  --seed 42 \
+  --use_outer_bg_split
+```
+
+These options are currently intended for the SLIC `n_segments=12000` configuration; other hyperparameters (k, alpha, etc.) remain unchanged.
+
 ### Expected Output
 
 ```
