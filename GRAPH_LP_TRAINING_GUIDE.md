@@ -64,7 +64,7 @@ python3 scripts/sample_strategic_sv_seeds.py \
   --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
   --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
   --budget_ratio 0.001 \
-  --outer_bg_distance 24.0 \
+  --outer_bg_target_bg_frac 0.7 \
   --boundary_bg_fraction 0.1 \
   --output_dir runs/strategic_sparse_0p1pct_outerbg/strategic_seeds \
   --seed 42

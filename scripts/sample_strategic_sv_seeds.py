@@ -37,6 +37,13 @@ from scipy.ndimage import sobel, distance_transform_edt
 from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, Orientationd
 from tqdm import tqdm
 
+# Ensure project root is on PYTHONPATH so wp5.* is importable when running as a script.
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from wp5.weaklabel.outer_bg_utils import choose_outer_bg_distance
+
 
 def load_split_cases(split_cfg: str, data_root: Path, split: str = "train") -> list:
     """Load case IDs from legacy split config (serial-based).
@@ -502,6 +509,9 @@ def process_case(
     class_weights: Dict[int, float],
     outer_bg_distance: float = 0.0,
     boundary_bg_fraction: float = 0.1,
+    outer_bg_target_bg_frac: float = 0.0,
+    outer_bg_min_distance: float = 1.0,
+    outer_bg_max_distance: float = 32.0,
     verbose: bool = True,
 ) -> Dict:
     """Process one case: load data, sample seeds, save outputs."""
@@ -564,12 +574,31 @@ def process_case(
     fg_svs = set()
     boundary_bg_svs = set()
     outer_bg_svs = set()
+    effective_outer_bg_distance = 0.0
+    outer_bg_bg_fraction = 0.0
+
     if outer_bg_distance is not None and outer_bg_distance > 0.0:
+        # Fixed global threshold (legacy behavior).
+        effective_outer_bg_distance = float(outer_bg_distance)
         fg_svs, boundary_bg_svs, outer_bg_svs = partition_supervoxels_by_distance(
             sv_ids=sv_ids,
             gt_labels=gt_labels,
-            outer_bg_distance=outer_bg_distance,
+            outer_bg_distance=effective_outer_bg_distance,
         )
+    elif outer_bg_target_bg_frac is not None and outer_bg_target_bg_frac > 0.0:
+        # Adaptive per-volume threshold based on GT background distances.
+        effective_outer_bg_distance, outer_bg_bg_fraction = choose_outer_bg_distance(
+            gt_labels=gt_labels,
+            target_outer_bg_frac=float(outer_bg_target_bg_frac),
+            min_distance=float(outer_bg_min_distance),
+            max_distance=float(outer_bg_max_distance),
+        )
+        if effective_outer_bg_distance > 0.0:
+            fg_svs, boundary_bg_svs, outer_bg_svs = partition_supervoxels_by_distance(
+                sv_ids=sv_ids,
+                gt_labels=gt_labels,
+                outer_bg_distance=effective_outer_bg_distance,
+            )
 
     # Sample seeds
     seed_mask, seed_sv_labels = sample_strategic_seeds(
@@ -581,7 +610,7 @@ def process_case(
         gradient_weight=1.0,
         centroid_weight=0.5,
         verbose=verbose,
-        outer_bg_distance=outer_bg_distance,
+        outer_bg_distance=effective_outer_bg_distance,
         boundary_bg_fraction=boundary_bg_fraction,
     )
 
@@ -605,11 +634,13 @@ def process_case(
         "sv_ids_shape": list(sv_ids.shape),
     }
     # Optional region stats for outer-background-aware runs.
-    if outer_bg_distance is not None and outer_bg_distance > 0.0:
+    if effective_outer_bg_distance > 0.0:
         meta.update(
             {
-                "outer_bg_distance": float(outer_bg_distance),
+                "outer_bg_distance": float(effective_outer_bg_distance),
                 "boundary_bg_fraction": float(boundary_bg_fraction),
+                "outer_bg_target_bg_frac": float(max(0.0, float(outer_bg_target_bg_frac))),
+                "outer_bg_bg_fraction": float(outer_bg_bg_fraction),
                 "n_fg_svs": int(len(fg_svs)),
                 "n_boundary_bg_svs": int(len(boundary_bg_svs)),
                 "n_outer_bg_svs": int(len(outer_bg_svs)),
@@ -632,7 +663,7 @@ def process_case(
 
 
 def _process_case_worker(
-    payload: Tuple[str, str, str, str, float, Dict[int, float], float, float]
+    payload: Tuple[str, str, str, str, float, Dict[int, float], float, float, float, float]
 ) -> Dict:
     """Wrapper for multiprocessing: payload carries only picklable types."""
     (
@@ -644,6 +675,9 @@ def _process_case_worker(
         class_weights,
         outer_bg_distance,
         boundary_bg_fraction,
+        outer_bg_target_bg_frac,
+        outer_bg_min_distance,
+        outer_bg_max_distance,
     ) = payload
     sv_dir = Path(sv_dir_str)
     data_root = Path(data_root_str)
@@ -658,6 +692,9 @@ def _process_case_worker(
             class_weights=class_weights,
             outer_bg_distance=outer_bg_distance,
             boundary_bg_fraction=boundary_bg_fraction,
+            outer_bg_target_bg_frac=outer_bg_target_bg_frac,
+            outer_bg_min_distance=outer_bg_min_distance,
+            outer_bg_max_distance=outer_bg_max_distance,
             verbose=False,
         )
     except Exception as e:
@@ -703,6 +740,28 @@ def main():
             "If >0, enable outer background split using this distance (voxels) "
             "to separate boundary vs outer background SVs."
         ),
+    )
+    parser.add_argument(
+        "--outer_bg_target_bg_frac",
+        type=float,
+        default=0.0,
+        help=(
+            "If >0 and --outer_bg_distance<=0, enable adaptive outer-background "
+            "threshold so that approximately this fraction of GT background voxels "
+            "are treated as outer BG for each case."
+        ),
+    )
+    parser.add_argument(
+        "--outer_bg_min_distance",
+        type=float,
+        default=1.0,
+        help="Minimum allowed outer-background distance when using adaptive mode (default: 1.0).",
+    )
+    parser.add_argument(
+        "--outer_bg_max_distance",
+        type=float,
+        default=32.0,
+        help="Maximum allowed outer-background distance when using adaptive mode (default: 32.0).",
     )
     parser.add_argument(
         "--boundary_bg_fraction",
@@ -761,7 +820,15 @@ def main():
     print(f"Class weights: {class_weights}")
     if args.outer_bg_distance > 0.0:
         print(
-            f"Outer background enabled: distance={args.outer_bg_distance}, "
+            f"Outer background enabled (fixed): distance={args.outer_bg_distance}, "
+            f"boundary_bg_fraction={args.boundary_bg_fraction}"
+        )
+    elif args.outer_bg_target_bg_frac > 0.0:
+        print(
+            "Outer background enabled (adaptive): "
+            f"target_bg_frac={args.outer_bg_target_bg_frac}, "
+            f"min_distance={args.outer_bg_min_distance}, "
+            f"max_distance={args.outer_bg_max_distance}, "
             f"boundary_bg_fraction={args.boundary_bg_fraction}"
         )
 
@@ -779,8 +846,11 @@ def main():
                 output_dir=output_dir,
                 budget_ratio=args.budget_ratio,
                 class_weights=class_weights,
-                 outer_bg_distance=args.outer_bg_distance,
-                 boundary_bg_fraction=args.boundary_bg_fraction,
+                outer_bg_distance=args.outer_bg_distance,
+                boundary_bg_fraction=args.boundary_bg_fraction,
+                outer_bg_target_bg_frac=args.outer_bg_target_bg_frac,
+                outer_bg_min_distance=args.outer_bg_min_distance,
+                outer_bg_max_distance=args.outer_bg_max_distance,
                 verbose=True,
             )
             if meta:
@@ -797,6 +867,9 @@ def main():
                 class_weights,
                 float(args.outer_bg_distance),
                 float(args.boundary_bg_fraction),
+                float(args.outer_bg_target_bg_frac),
+                float(args.outer_bg_min_distance),
+                float(args.outer_bg_max_distance),
             )
             for case_id in cases
         ]
