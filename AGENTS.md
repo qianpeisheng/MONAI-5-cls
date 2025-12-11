@@ -509,15 +509,7 @@ python3 train_finetune_wp5.py \
   --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
   --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
   --train_label_override_dir /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted \
-  --output_dir runs/train_sv_best_slic_n20000 \
-  --epochs 20 \
-  --batch_size 2 \
-  --num_workers 4 \
-  --init scratch \
-  --net basicunet \
-  --norm clip_zscore \
-  --roi_x 112 --roi_y 112 --roi_z 80 \
-  --log_to_file
+  --output_dir runs/train_sv_best_slic_n20000
 ```
 
 **Without the flag** (standard GT training):
@@ -527,12 +519,7 @@ python3 train_finetune_wp5.py \
   --mode train \
   --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
   --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
-  --output_dir runs/train_baseline_gt \
-  --epochs 20 \
-  --batch_size 2 \
-  --num_workers 4 \
-  --init scratch \
-  --net basicunet
+  --output_dir runs/train_baseline_gt
 ```
 
 ### Available Supervoxel Label Directories (legacy dataset only)
@@ -1034,4 +1021,4 @@ Replicating baselines
 
 External precompute (1% points, no dilation)
 - Precompute: `. /home/peisheng/MONAI/venv/bin/activate && python3 scripts/precompute_sup_masks.py --mode few_points_global --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --subset_ratio 1.0 --ratio 0.01 --dilate_radius 0 --balance proportional --seed 42 --fp_sample_mode uniform_all --out_dir runs/sup_masks_1pct_uniform_all`
-- Train: `. /home/peisheng/MONAI/venv/bin/activate && CUDA_VISIBLE_DEVICES=1 python3 -u train_finetune_wp5.py --mode train --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --output_dir runs/fewpoints_01pct_static_from_dir --epochs 20 --batch_size 2 --num_workers 4 --init scratch --net basicunet --subset_ratio 1.0 --seed 42 --fewshot_mode few_points --fewshot_ratio 0.01 --fewshot_static --sup_masks_dir runs/sup_masks_1pct_uniform_all --pseudo_weight 0.0 --fg_crop_prob 0.0 --coverage_mode seeds --norm clip_zscore --roi_x 112 --roi_y 112 --roi_z 80 --log_to_file`
+- Train: `. /home/peisheng/MONAI/venv/bin/activate && CUDA_VISIBLE_DEVICES=1 python3 -u train_finetune_wp5.py --mode train --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json --output_dir runs/fewpoints_01pct_static_from_dir --init scratch --net basicunet --subset_ratio 1.0 --seed 42 --fewshot_mode few_points --fewshot_ratio 0.01 --fewshot_static --sup_masks_dir runs/sup_masks_1pct_uniform_all --pseudo_weight 0.0 --fg_crop_prob 0.0 --coverage_mode seeds --norm clip_zscore --roi_x 112 --roi_y 112 --roi_z 80 --log_to_file`

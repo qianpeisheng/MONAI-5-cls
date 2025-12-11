@@ -135,7 +135,7 @@ Expected output:
 
 ## Step 2: Train Model with Graph LP Labels
 
-### Command
+### Command (legacy dataset example)
 
 ```bash
 python3 train_finetune_wp5.py \
@@ -146,15 +146,7 @@ python3 train_finetune_wp5.py \
   --train_label_source_dir runs/graph_lp_prop_0p1pct_k10_a0.9/source_masks \
   --source_weight_gt 1.0 \
   --source_weight_lp 0.5 \
-  --output_dir runs/train_graph_lp_k10_a0.9_0p1pct \
-  --epochs 20 \
-  --batch_size 2 \
-  --num_workers 4 \
-  --init scratch \
-  --net basicunet \
-  --norm clip_zscore \
-  --roi_x 112 --roi_y 112 --roi_z 80 \
-  --log_to_file
+  --output_dir runs/train_graph_lp_k10_a0.9_0p1pct
 ```
 
 ### Key Arguments
@@ -166,8 +158,8 @@ python3 train_finetune_wp5.py \
 | `--source_weight_gt` | 1.0 | Loss weight for GT-supported SVs |
 | `--source_weight_lp` | 0.5 | Loss weight for Graph-only SVs |
 | `--output_dir` | Training output dir | Checkpoints and logs saved here |
-| `--epochs` | 20 | Standard training duration |
-| `--batch_size` | 2 | Adjust based on GPU memory |
+| `--epochs` | (default 40) | Total training epochs (use script default unless you need a shorter run) |
+| `--batch_size` | (default 4) | Adjust based on GPU memory if needed |
 | `--init` | scratch | Train from random initialization |
 | `--net` | basicunet | Model architecture |
 | `--norm` | clip_zscore | Normalization method |
@@ -276,16 +268,13 @@ python3 scripts/propagate_graph_lp_multi_case.py \
   --output_dir runs/graph_lp_prop_0p1pct_k10_a0.9 \
   --seed 42
 
-# Step 2: Train model (12-18 hours)
+# Step 2: Train model
 python3 train_finetune_wp5.py \
   --mode train \
   --data_root /data3/wp5/wp5-code/dataloaders/wp5-dataset \
   --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
   --train_label_override_dir runs/graph_lp_prop_0p1pct_k10_a0.9/labels \
-  --output_dir runs/train_graph_lp_k10_a0.9_0p1pct \
-  --epochs 20 --batch_size 2 --num_workers 4 \
-  --init scratch --net basicunet --norm clip_zscore \
-  --roi_x 112 --roi_y 112 --roi_z 80 --log_to_file
+  --output_dir runs/train_graph_lp_k10_a0.9_0p1pct
 
 # Step 3: Evaluate (1-2 hours)
 python3 scripts/eval_wp5.py \
