@@ -918,6 +918,15 @@ Tools
     - 3D offers Matplotlib (static) and PyVista (interactive). PyVista volume/surface axes are aligned to (X,Y,Z); spacing uses NIfTI affine norms (dx,dy,dz).
     - Metrics shown per case: Dice and IoU for classes 0..4, ignoring label 6.
 
+- Pseudo Labels Inspector — tri‑plane 2D + 3D, with debug overlays (GraphLP / pseudo labels vs GT)
+  - Script: `scripts/vis_pseudolabels_streamlit.py`
+  - Pseudo input: folder with `<id>_labels.npy` (or a run folder that contains a `labels/` subdir).
+  - Optional seed/source mask: folder with `<id>_source.npy` (GraphLP source mask) or `<id>_strategic_seeds.npy` (strategic seeds).
+  - Launch (example, train split): `python3 -m streamlit run scripts/vis_pseudolabels_streamlit.py -- --datalist /home/peisheng/MONAI/datalist_train_new.json --pseudo-dir /home/peisheng/MONAI/runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive/labels --seed-mask-dir /home/peisheng/MONAI/runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive/source_masks`
+  - Notes:
+    - GraphLP propagation outputs are typically train‑only; use `datalist_train_new.json` and enable “Show only cases with pseudo available”.
+    - 3D supports Scatter (fast) and Mesh (requires `scikit-image`).
+
 - Fixed eval comparisons (legacy) — GT vs up to 4 prediction folders
   - Script: `scripts/vis_wp5_streamlit.py`
   - Launch: `python3 -m streamlit run scripts/vis_wp5_streamlit.py`
