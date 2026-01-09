@@ -144,8 +144,9 @@ python3 train_finetune_wp5.py \
   --split_cfg /data3/wp5/wp5-code/dataloaders/wp5-dataset/3ddl_split_config_20250801.json \
   --train_label_override_dir runs/graph_lp_prop_0p1pct_k10_a0.9/labels \
   --train_label_source_dir runs/graph_lp_prop_0p1pct_k10_a0.9/source_masks \
-  --source_weight_gt 1.0 \
-  --source_weight_lp 0.5 \
+  --source_weight_mode decoupled \
+  --source_imbalance_scope dataset \
+  --source_lp_quality 0.2 \
   --output_dir runs/train_graph_lp_k10_a0.9_0p1pct
 ```
 
@@ -155,8 +156,9 @@ python3 train_finetune_wp5.py \
 |----------|-------|-------------|
 | `--train_label_override_dir` | Path to propagated labels | **Critical:** Uses Graph LP labels instead of GT |
 | `--train_label_source_dir` | Path to source masks | Per-voxel reliability (1=SV had GT seed, 0=Graph-only) |
-| `--source_weight_gt` | 1.0 | Loss weight for GT-supported SVs |
-| `--source_weight_lp` | 0.5 | Loss weight for Graph-only SVs |
+| `--source_weight_mode` | decoupled | `raw`: use `--source_weight_lp` directly. `decoupled`: separate imbalance normalization from pseudo-label confidence. |
+| `--source_imbalance_scope` | dataset | `dataset`: compute fixed ratio `r=N_gt/N_lp` from all source masks once. `batch`: compute `r` per cropped batch (fast) with dataset fallback. |
+| `--source_lp_quality` | 0.2 | `gamma` in `[0.1,1]` (recommended) controlling how much confidence to place on graph-only SV labels after normalization. |
 | `--output_dir` | Training output dir | Checkpoints and logs saved here |
 | `--epochs` | (default 40) | Total training epochs (use script default unless you need a shorter run) |
 | `--batch_size` | (default 4) | Adjust based on GPU memory if needed |
@@ -164,6 +166,14 @@ python3 train_finetune_wp5.py \
 | `--net` | basicunet | Model architecture |
 | `--norm` | clip_zscore | Normalization method |
 | `--roi_x/y/z` | 112/112/80 | Patch size for training |
+
+**Loss weighting math (decoupled mode)**:
+- Let `N_gt` be the number of voxels with `label_source==1` (GT-supported SVs) and `N_lp` with `label_source==0` (graph-only SVs). Because of supervoxel expansion, `N_gt/(N_gt+N_lp)` can be much larger than the raw seed budget.
+- The script fixes `w_gt=1.0` and computes `w_lp = r * gamma`, where `r = N_gt/N_lp` and `gamma = --source_lp_quality`.
+- With the weighted-mean CE implementation, this makes the *total* weight-mass ratio `(w_lp*N_lp)/(w_gt*N_gt)` approximately `gamma`, which is easier to report/tune than raw `w_lp`.
+
+**Legacy behavior (raw mode)**:
+- Use `--source_weight_mode raw --source_weight_lp <value>`. Note: `--source_weight_gt` is fixed to 1.0 and ignored.
 
 ### Expected Output
 

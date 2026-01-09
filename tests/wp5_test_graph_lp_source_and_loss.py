@@ -22,6 +22,8 @@ from scripts.propagate_graph_lp_multi_case import (
     create_training_symlinks,
 )
 from train_finetune_wp5 import (
+    compute_label_source_stats_from_dir,
+    compute_label_source_gt_to_lp_ratio_batch,
     cross_entropy_with_voxel_weights,
     dice_loss_masked,
     dice_loss_masked_weighted,
@@ -208,3 +210,87 @@ def test_dice_loss_weighted_equals_unweighted_for_unit_weights():
     weighted = dice_loss_masked_weighted(logits, target, ignore_mask, weights)
 
     assert torch.allclose(base, weighted, atol=1e-6)
+
+
+def test_compute_label_source_stats_from_dir(tmp_path: Path):
+    src_dir = tmp_path / "source_masks"
+    src_dir.mkdir()
+
+    # Two cases with known GT-supported (1) vs LP-only (0) voxel counts.
+    # Total ones=3, zeros=5 => ratio_gt_to_lp = 3/5 = 0.6
+    np.save(src_dir / "A_source.npy", np.array([1, 0, 0, 0], dtype=np.uint8).reshape(2, 2, 1))
+    np.save(src_dir / "B_source.npy", np.array([1, 1, 0, 0], dtype=np.uint8).reshape(2, 2, 1))
+
+    stats = compute_label_source_stats_from_dir(src_dir)
+    assert stats["n_gt_voxels"] == 3
+    assert stats["n_lp_voxels"] == 5
+    assert abs(stats["ratio_gt_to_lp"] - 0.6) < 1e-12
+
+    # Filtering by case id should change the ratio deterministically.
+    stats_a = compute_label_source_stats_from_dir(src_dir, case_ids=["A"])
+    assert stats_a["n_gt_voxels"] == 1
+    assert stats_a["n_lp_voxels"] == 3
+    assert abs(stats_a["ratio_gt_to_lp"] - (1.0 / 3.0)) < 1e-12
+
+
+def test_compute_label_source_gt_to_lp_ratio_batch_uses_valid_mask():
+    # src: 3 GT-supported voxels and 1 LP-only voxel => base ratio 3/1
+    src = torch.tensor([1, 1, 1, 0], dtype=torch.float32).view(1, 1, 2, 2, 1)
+    valid = torch.ones_like(src, dtype=torch.bool)
+
+    r = compute_label_source_gt_to_lp_ratio_batch(src, valid_mask=valid, fallback_ratio=1.0)
+    assert abs(r - 3.0) < 1e-12
+
+    # Ignore one GT-supported voxel: 2 GT vs 1 LP => ratio 2/1
+    valid2 = valid.clone()
+    valid2.view(-1)[0] = False
+    r2 = compute_label_source_gt_to_lp_ratio_batch(src, valid_mask=valid2, fallback_ratio=1.0)
+    assert abs(r2 - 2.0) < 1e-12
+
+    # Degenerate: no LP voxels -> should return fallback (to avoid inf).
+    src_all_gt = torch.ones_like(src)
+    r3 = compute_label_source_gt_to_lp_ratio_batch(src_all_gt, valid_mask=valid, fallback_ratio=0.42)
+    assert abs(r3 - 0.42) < 1e-12
+
+
+def test_decoupled_weighting_matches_closed_form_for_ce():
+    """
+    With w_gt fixed to 1 and w_lp_eff = (|G|/|P|)*gamma, the weighted-mean CE should satisfy:
+        CE = (mean_G + gamma * mean_P) / (1 + gamma)
+    """
+    torch.manual_seed(0)
+    logits = torch.randn(1, 3, 2, 2, 1)  # 4 voxels
+    target = torch.tensor([0, 1, 2, 0], dtype=torch.long).view(1, 1, 2, 2, 1)
+
+    # 2 GT-supported voxels (G) and 2 LP-only voxels (P)
+    src = torch.tensor([1, 1, 0, 0], dtype=torch.float32).view(1, 1, 2, 2, 1)
+    gamma = 0.2
+
+    # Compute r = |G|/|P| and w_lp_eff = r * gamma
+    n_gt = int((src > 0.5).sum().item())
+    n_lp = int((src <= 0.5).sum().item())
+    assert n_gt == 2 and n_lp == 2
+    r = n_gt / n_lp
+    w_lp_eff = r * gamma
+
+    # Verify the intended total weight-mass ratio is gamma.
+    q = (w_lp_eff * n_lp) / (1.0 * n_gt)
+    assert abs(q - gamma) < 1e-12
+
+    weights = torch.where(src > 0.5, torch.ones_like(src), torch.full_like(src, float(w_lp_eff)))
+
+    ce = cross_entropy_with_voxel_weights(
+        logits=logits,
+        target=target,
+        weight_map=weights,
+        ignore_index=255,
+    )
+
+    # Closed form using group means of the per-voxel CE map
+    ce_map = F.cross_entropy(logits, target.squeeze(1), reduction="none")  # (1,2,2,1)
+    g = (src.squeeze(1) > 0.5)
+    mean_g = ce_map[g].mean()
+    mean_p = ce_map[~g].mean()
+    expected = (mean_g + gamma * mean_p) / (1.0 + gamma)
+
+    assert torch.allclose(ce, expected, atol=1e-6)

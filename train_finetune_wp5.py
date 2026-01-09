@@ -1251,6 +1251,107 @@ def cross_entropy_with_voxel_weights(
     return loss
 
 
+def compute_label_source_stats_from_dir(
+    source_dir: Path,
+    case_ids: list[str] | None = None,
+    threshold: float = 0.5,
+) -> Dict[str, float]:
+    """Compute dataset-level stats for Graph-LP label source masks.
+
+    A label-source mask marks voxel reliability based on supervoxel membership:
+      - 1: voxel belongs to a supervoxel that contains >=1 GT-derived seed ("GT-supported SV")
+      - 0: voxel belongs to a supervoxel labeled purely via graph propagation ("LP-only SV")
+
+    Note: due to supervoxel expansion, the fraction of GT-supported voxels can be far larger
+    than the raw seed budget (e.g., 0.1% seeds can yield ~5–15% GT-supported voxels).
+
+    Returns a dict with counts and ratios. The key ratio for loss normalization is:
+      ratio_gt_to_lp = N_gt / N_lp
+    which can be used to compute the LP voxel weight in the "decoupled" scheme:
+      w_lp_eff = ratio_gt_to_lp * gamma   (with w_gt fixed to 1)
+    """
+    source_dir = Path(source_dir)
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Label source dir not found: {source_dir}")
+
+    if case_ids is None:
+        files = sorted(source_dir.glob("*_source.npy"))
+    else:
+        files = []
+        for cid in case_ids:
+            safe_id = str(cid).replace("/", "_")
+            p = source_dir / f"{safe_id}_source.npy"
+            if not p.exists():
+                raise FileNotFoundError(f"Missing label source file: {p}")
+            files.append(p)
+
+    n_gt = 0
+    n_lp = 0
+    n_total = 0
+    for p in files:
+        arr = np.load(p, mmap_mode="r")
+        # Allow either (X,Y,Z) or (1,X,Y,Z)
+        if getattr(arr, "ndim", 0) == 4:
+            arr = arr[0]
+        gt = int(np.count_nonzero(arr > threshold))
+        tot = int(arr.size)
+        lp = int(tot - gt)
+        n_gt += gt
+        n_lp += lp
+        n_total += tot
+
+    frac_gt = (n_gt / n_total) if n_total > 0 else 0.0
+    frac_lp = (n_lp / n_total) if n_total > 0 else 0.0
+
+    # Safe ratios for degenerate cases (no GT-supported or no LP-only voxels).
+    if n_gt == 0 or n_lp == 0:
+        ratio_gt_to_lp = 1.0
+        ratio_lp_to_gt = 1.0
+    else:
+        ratio_gt_to_lp = n_gt / n_lp
+        ratio_lp_to_gt = n_lp / n_gt
+
+    return {
+        "n_gt_voxels": int(n_gt),
+        "n_lp_voxels": int(n_lp),
+        "n_total_voxels": int(n_total),
+        "frac_gt": float(frac_gt),
+        "frac_lp": float(frac_lp),
+        "ratio_gt_to_lp": float(ratio_gt_to_lp),
+        "ratio_lp_to_gt": float(ratio_lp_to_gt),
+    }
+
+
+def compute_label_source_gt_to_lp_ratio_batch(
+    src: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    threshold: float = 0.5,
+    fallback_ratio: float = 1.0,
+) -> float:
+    """Compute r = N_gt / N_lp for a single batch from label_source tensor.
+
+    - src: (B,1,...) or (B,...), float/bool compatible.
+    - valid_mask: optional boolean mask selecting voxels to count (e.g., label!=6 and/or valid FOV).
+    - fallback_ratio: returned when the batch has no GT-supported or no LP-only voxels (avoids inf/0).
+    """
+    s = src
+    if s.dtype != torch.bool:
+        gt = (s > threshold)
+    else:
+        gt = s
+
+    if valid_mask is None:
+        include = torch.ones_like(gt, dtype=torch.bool)
+    else:
+        include = valid_mask.to(dtype=torch.bool)
+
+    n_gt = int((gt & include).sum().item())
+    n_lp = int(((~gt) & include).sum().item())
+    if n_gt == 0 or n_lp == 0:
+        return float(fallback_ratio)
+    return float(n_gt / n_lp)
+
+
 def compute_metrics(
     pred: torch.Tensor,
     gt: torch.Tensor,
@@ -1897,6 +1998,52 @@ def train(args):
         print(f"✓ Successfully mapped all {len(train_list)} cases to override labels")
         print(f"{'='*60}\n")
 
+    # Graph-LP label source masks can optionally weight losses for GT-supported vs graph-only SVs.
+    # Keep the GT-supported weight fixed to 1.0 for interpretability (still use w_gt variable for clarity).
+    w_gt = 1.0
+    if float(getattr(args, "source_weight_gt", 1.0)) != 1.0:
+        print("WARNING: --source_weight_gt is fixed to 1.0 and any provided value will be ignored.")
+
+    source_weight_mode = str(getattr(args, "source_weight_mode", "raw"))
+    source_imbalance_scope = str(getattr(args, "source_imbalance_scope", "dataset"))
+    source_lp_quality = float(getattr(args, "source_lp_quality", 1.0))
+
+    # Dataset-level ratio r=N_gt/N_lp is used directly for scope=dataset and as a safe fallback for scope=batch.
+    label_source_stats: Dict[str, float] | None = None
+    ratio_gt_to_lp_data = 1.0
+    if (
+        getattr(args, "train_label_source_dir", "") != ""
+        and args.fewshot_mode == "few_samples"
+        and source_weight_mode == "decoupled"
+    ):
+        case_ids = [str(d.get("id")) for d in train_list if d.get("id") is not None]
+        label_source_stats = compute_label_source_stats_from_dir(
+            Path(args.train_label_source_dir),
+            case_ids=case_ids,
+        )
+        ratio_gt_to_lp_data = float(label_source_stats["ratio_gt_to_lp"])
+        try:
+            (out_dir / "metrics" / "label_source_stats.json").write_text(json.dumps(label_source_stats, indent=2))
+        except Exception:
+            pass
+
+        w_lp_eff_data = w_gt * ratio_gt_to_lp_data * source_lp_quality
+        n_gt = float(label_source_stats.get("n_gt_voxels", 0.0))
+        n_lp = float(label_source_stats.get("n_lp_voxels", 0.0))
+        q = (w_lp_eff_data * n_lp / (w_gt * n_gt)) if (n_gt > 0 and n_lp > 0) else None
+
+        print("\n" + "=" * 60)
+        print("LABEL SOURCE LOSS WEIGHTING (DECOUPLED)")
+        print("=" * 60)
+        print(f"w_gt fixed: {w_gt:.3f}")
+        print(f"imbalance scope: {source_imbalance_scope}")
+        print(f"dataset ratio r = N_gt/N_lp: {ratio_gt_to_lp_data:.6f}")
+        print(f"quality gamma (tune): {source_lp_quality:.6f}")
+        print(f"effective w_lp = w_gt * r * gamma: {w_lp_eff_data:.6f}")
+        if q is not None:
+            print(f"effective mass ratio q = (w_lp*N_lp)/(w_gt*N_gt): {q:.6f} (expected ~ gamma)")
+        print("=" * 60 + "\n")
+
     # Transforms and datasets
     # Where to save/load static supervision masks
     if getattr(args, "sup_masks_dir", ""):
@@ -2049,6 +2196,11 @@ def train(args):
         cov_sum_seeds = 0.0
         cov_sum_sup = 0.0
         pl_cov_sum = 0.0
+        # Track per-batch imbalance ratio stats when using decoupled+batch weighting.
+        src_r_sum = 0.0
+        src_r_n = 0
+        src_r_min: float | None = None
+        src_r_max: float | None = None
         t0 = time.time()
         # global counter of debug grad checks across training
         if not hasattr(train, "_grad_checks_done"):
@@ -2067,9 +2219,38 @@ def train(args):
             )
             if use_source_weights:
                 src = batch["label_source"].to(device).float()  # (B,1,X,Y,Z)
-                w_gt = float(getattr(args, "source_weight_gt", 1.0))
-                w_lp = float(getattr(args, "source_weight_lp", 1.0))
-                label_source_weights = torch.where(src > 0.5, w_gt, w_lp)
+                if source_weight_mode == "raw":
+                    # Legacy behavior: directly weight LP-only voxels by --source_weight_lp (GT weight fixed to 1.0).
+                    w_lp_eff = float(getattr(args, "source_weight_lp", 1.0))
+                elif source_weight_mode == "decoupled":
+                    # Decouple imbalance normalization from pseudo-label confidence:
+                    #   r = N_gt/N_lp (dataset or batch)
+                    #   gamma = --source_lp_quality (tunable, ideally 0.1..1 for reviewer-friendly reporting)
+                    #   w_lp_eff = w_gt * r * gamma
+                    if source_imbalance_scope == "batch":
+                        r_batch = compute_label_source_gt_to_lp_ratio_batch(
+                            src=src,
+                            valid_mask=ignore_mask,
+                            fallback_ratio=ratio_gt_to_lp_data,
+                        )
+                        src_r_sum += float(r_batch)
+                        src_r_n += 1
+                        src_r_min = float(r_batch) if src_r_min is None else min(src_r_min, float(r_batch))
+                        src_r_max = float(r_batch) if src_r_max is None else max(src_r_max, float(r_batch))
+                        r = float(r_batch)
+                    elif source_imbalance_scope == "dataset":
+                        r = float(ratio_gt_to_lp_data)
+                    else:
+                        raise ValueError(f"Unknown --source_imbalance_scope: {source_imbalance_scope}")
+                    w_lp_eff = float(w_gt) * float(r) * float(source_lp_quality)
+                else:
+                    raise ValueError(f"Unknown --source_weight_mode: {source_weight_mode}")
+
+                label_source_weights = torch.where(
+                    src > 0.5,
+                    torch.ones_like(src) * float(w_gt),
+                    torch.ones_like(src) * float(w_lp_eff),
+                )
             else:
                 label_source_weights = None
 
@@ -2290,6 +2471,10 @@ def train(args):
             + f" - avg_cov({getattr(args, 'coverage_mode', 'sup')}) {cov_epoch:.6g}" + extra_cov
             + (f" - pl_coverage {plcov_epoch:.6g}" if args.pl_enable else "")
         )
+        if source_weight_mode == "decoupled" and source_imbalance_scope == "batch" and src_r_n > 0:
+            r_mean = src_r_sum / max(src_r_n, 1)
+            # src_r_min/max are populated when src_r_n > 0
+            print(f"  label_source r_batch: mean={r_mean:.6f}, min={src_r_min:.6f}, max={src_r_max:.6f}")
 
         # Evaluate on test set (fast: skip HD/ASD to keep GPU utilization higher)
         metrics = evaluate(
@@ -2388,7 +2573,7 @@ def parse_args(argv: List[str] | None = None):
         help="[Optional] Override training labels with alternative labels (e.g., supervoxel-voted labels). "
              "Supports .npy and .nii formats. If not specified, uses original GT labels. "
              "Example: /data3/wp5/monai-sv-sweeps/sv_fullgt_slic_n20000_c0.05_s1.0_ras2_voted",
-    )
+     )
     p.add_argument(
         "--train_label_source_dir",
         type=str,
@@ -2396,12 +2581,12 @@ def parse_args(argv: List[str] | None = None):
         help=(
             "[Optional] Directory with per-voxel label source masks (e.g., Graph LP reliability) "
             "saved as <id>_source.npy; used to weight loss between SVs with GT-derived seeds and "
-            "purely graph-propagated SVs in few_samples mode."
+            "purely graph-propagated SVs in few_samples mode. See --source_weight_mode/--source_imbalance_scope/--source_lp_quality."
         ),
     )
-    p.add_argument("--epochs", type=int, default=30)
-    p.add_argument("--batch_size", type=int, default=2)
-    p.add_argument("--num_workers", type=int, default=4)
+    p.add_argument("--epochs", type=int, default=40)
+    p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3, help="Learning rate for scratch training (Novograd/Adam)")
     p.add_argument("--lr_ft", type=float, default=3e-4, help="Learning rate for finetuning when --init pretrained (Novograd/Adam)")
     p.add_argument("--subset_ratio", type=float, default=1.0, help="Proportion of train data to use (e.g., 1.0, 0.1, 0.01)")
@@ -2459,17 +2644,49 @@ def parse_args(argv: List[str] | None = None):
     p.add_argument("--global_budget", action="store_true", default=True, help="Enforce fewshot_ratio globally across the entire train set (seed budget)")
     p.add_argument("--seed_bg_frac", type=float, default=0.10, help="Global seed budget fraction reserved for background (class 0)")
     p.add_argument("--pseudo_weight", type=float, default=0.3, help="Loss weight for propagated labels in dilated regions (pseudo supervision)")
+    # Graph-LP label source weighting (few_samples only; requires --train_label_source_dir)
+    p.add_argument(
+        "--source_weight_mode",
+        type=str,
+        default="raw",
+        choices=["raw", "decoupled"],
+        help=(
+            "How to weight loss using per-voxel label_source masks in few_samples mode. "
+            "'raw': w_gt=1 and w_lp=--source_weight_lp. "
+            "'decoupled': w_gt=1 and w_lp=(N_gt/N_lp)*gamma, where gamma=--source_lp_quality and "
+            "N_gt/N_lp is computed from the dataset or per batch per --source_imbalance_scope."
+        ),
+    )
+    p.add_argument(
+        "--source_imbalance_scope",
+        type=str,
+        default="dataset",
+        choices=["dataset", "batch"],
+        help=(
+            "When --source_weight_mode=decoupled, compute r=N_gt/N_lp from the whole train set ('dataset') "
+            "or from each cropped batch ('batch', fast). Dataset r is also used as a fallback for degenerate batches."
+        ),
+    )
+    p.add_argument(
+        "--source_lp_quality",
+        type=float,
+        default=1.0,
+        help=(
+            "When --source_weight_mode=decoupled, gamma (pseudo-label confidence) applied after imbalance normalization. "
+            "Tunable hyper-parameter; recommend 0.1..1 for reviewer-friendly reporting."
+        ),
+    )
     p.add_argument(
         "--source_weight_gt",
         type=float,
         default=1.0,
-        help="Per-voxel loss weight for SVs whose labels are directly supported by GT seeds (label_source=1).",
+        help="[Deprecated] Kept for backward compatibility; GT-supported voxel weight is fixed to 1.0.",
     )
     p.add_argument(
         "--source_weight_lp",
         type=float,
         default=1.0,
-        help="Per-voxel loss weight for SVs labeled purely via graph propagation (label_source=0).",
+        help="In --source_weight_mode=raw: per-voxel loss weight for LP-only voxels (label_source=0). Ignored in decoupled mode.",
     )
     # Few-shot fixed-budget control
     p.add_argument("--fewshot_static", action="store_true", help="Use a fixed per-volume supervision mask (precomputed once) for few_points mode")
