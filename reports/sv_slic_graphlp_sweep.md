@@ -6,6 +6,7 @@
 - Ignore label: `6`
 - Seeds: `runs/strategic_sparse_0p1pct_new/strategic_seeds` (0.1% budget, class weights 0.1,1,1,2,2)
 - Graph LP: `k=10`, `alpha=0.9`, `num_classes=5`
+- Note: Graph LP here uses the coords-only affinity (`--descriptor_type none`). Intensity-aware variants (`moments`, `quantiles16`, `hist32`) are supported but not included in this sweep.
 - Workers: 16 for gen/eval/LP
 - Outputs per n:
   - SV (full-GT vote): `runs/sv_fullgt_slic_n${N}_new_ras` (+ `_eval`)

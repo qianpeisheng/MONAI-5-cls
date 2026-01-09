@@ -271,6 +271,40 @@ def graph_label_propagation(
     return pred_labels
 
 
+def graph_label_propagation_from_affinity(
+    W: csr_matrix,
+    sv_labels: np.ndarray,
+    num_classes: int,
+    alpha: float = 0.99,
+    max_iter: int = 1000,
+    tol: float = 1e-6,
+    return_scores: bool = False,
+) -> np.ndarray:
+    """Run Zhou label propagation using a precomputed affinity matrix W.
+
+    This keeps the Zhou LP solver unchanged; it only bypasses kNN feature->W construction.
+    """
+    if W.ndim != 2 or W.shape[0] != W.shape[1]:
+        raise ValueError(f"W must be square, got shape={W.shape}")
+
+    N = int(W.shape[0])
+    if N == 0:
+        result = np.array([], dtype=np.int64)
+        return (result, np.array([], dtype=np.float32)) if return_scores else result
+
+    assert sv_labels.shape[0] == N, "W and labels must have same length"
+    assert 0 < alpha < 1, "Alpha must be in (0, 1)"
+    assert num_classes > 0, "num_classes must be positive"
+
+    S = _compute_normalized_similarity(W)
+    Y = _construct_label_matrix(sv_labels, num_classes)
+    F, _, _ = _iterative_propagation(S, Y, alpha, max_iter, tol)
+    pred_labels = np.argmax(F, axis=1).astype(np.int64)
+    if return_scores:
+        return pred_labels, F
+    return pred_labels
+
+
 def graph_label_propagation_scores(
     sv_features: np.ndarray,
     sv_labels: np.ndarray,
@@ -296,5 +330,6 @@ def graph_label_propagation_scores(
 
 __all__ = [
     'graph_label_propagation',
+    'graph_label_propagation_from_affinity',
     'graph_label_propagation_scores',
 ]

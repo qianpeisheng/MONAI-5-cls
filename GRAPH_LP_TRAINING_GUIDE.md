@@ -85,6 +85,38 @@ python3 scripts/propagate_graph_lp_multi_case.py \
 
 These options are currently intended for the SLIC `n_segments=12000` configuration; other hyperparameters (k, alpha, etc.) remain unchanged.
 
+**Optional (intensity-aware graph weights, solver unchanged):**
+
+By default, Graph LP builds its kNN graph and weights using only SV centroid coordinates. You can optionally add an **intensity descriptor term** (computed per SV from the corresponding image volume) *without changing the Zhou LP solver* — only the affinity matrix `W` changes:
+
+```
+w_ij = exp( -||c_i - c_j||^2 / (2*sigma_c^2) ) * exp( -d(phi_i, phi_j)^2 / (2*sigma_phi^2) )
+```
+
+- `c_i`: SV centroid (existing behavior)
+- `phi_i`: SV intensity descriptor (new)
+- `d`: L2 or cosine distance for `moments` / `quantiles16`; chi-square for `hist32`
+- Intensity normalization: per-volume robust clip+zscore (same as `scripts/gen_supervoxels_wp5.py:pclip_zscore`), so histogram range `[-3,3]` is meaningful.
+- Coords-only remains available as `--descriptor_type none` (default, no `--datalist` needed).
+
+Descriptor options:
+- `--descriptor_type moments`: `[median, MAD, trimmed_mean(10%), P10, P25, P50, P75, P90]`
+- `--descriptor_type quantiles16`: 16 quantiles at `q = 0,1/15,...,1` (+ optional `--quantiles_include_mad`)
+- `--descriptor_type hist32`: normalized histogram over fixed range (default `--hist_bins 32 --hist_range -3 3`), compared via chi-square distance.
+
+Sigma option:
+- `--sigma_phi median`: estimates `sigma_phi` as the median of descriptor distances over a sample of neighbor edges (default up to 50k edges).
+
+Example (new default dataset, coords + moments descriptor):
+```bash
+python3 scripts/pipeline_graph_lp_sv.py --sv_dir runs/sv_fullgt_slic_n12000_new_ras --seeds_dir runs/strategic_sparse_0p1pct_new/strategic_seeds --datalist datalist_train_new.json --data_root /data3/wp5_4_Dec_data/3ddl-dataset/data --output_dir runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_moments --k 10 --alpha 0.9 --num_classes 5 --seed 42 --lp_num_workers 16 --eval_num_workers 16 --eval_progress --eval_log_to_file --eval_heavy --descriptor_type moments --sigma_phi median
+```
+
+Convenience script (runs moments + quantiles16 + hist32 sequentially and evaluates each vs GT):
+```bash
+bash scripts/run_graph_lp_3_descriptors_then_eval.sh
+```
+
 ### Expected Output
 
 ```
@@ -426,7 +458,10 @@ Based on single-volume experiments (case SN13B0_I17_3D_B1_1B250409):
 
 **Implementation:**
 - Graph LP algorithm: `wp5/weaklabel/graph_label_propagation.py`
+- Graph affinity (coords + descriptors): `wp5/weaklabel/graph_affinity.py`
+- SV intensity descriptors: `wp5/weaklabel/sv_descriptors.py`
 - Batch propagation: `scripts/propagate_graph_lp_multi_case.py`
+- Descriptor + eval runner: `scripts/run_graph_lp_3_descriptors_then_eval.sh`
 - Training script: `train_finetune_wp5.py`
 - Evaluation: `scripts/eval_wp5.py`
 
@@ -441,4 +476,4 @@ Zhou et al., "Learning with Local and Global Consistency", NIPS 2003
 
 ---
 
-**Last Updated:** 2025-11-13
+**Last Updated:** 2026-01-09

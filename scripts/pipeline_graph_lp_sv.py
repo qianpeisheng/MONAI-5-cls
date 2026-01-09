@@ -143,6 +143,61 @@ def main() -> None:
             "and force outer-background SVs to label 0 (requires seeds_meta with outer_bg_sv_ids)."
         ),
     )
+    p.add_argument(
+        "--descriptor_type",
+        type=str,
+        default="none",
+        choices=["none", "moments", "quantiles16", "hist32"],
+        help="Optional intensity descriptor for graph weights (default: none = coords-only).",
+    )
+    p.add_argument(
+        "--descriptor_cache_dir",
+        type=str,
+        default="",
+        help="Optional cache directory for computed SV descriptors.",
+    )
+    p.add_argument(
+        "--use_cosine",
+        action="store_true",
+        help="Use cosine distance for moments/quantiles descriptors (default: L2).",
+    )
+    p.add_argument(
+        "--sigma_phi",
+        type=str,
+        default="median",
+        help="Descriptor kernel sigma: float or 'median' (default: median).",
+    )
+    p.add_argument(
+        "--quantiles_include_mad",
+        action="store_true",
+        help="If set, append MAD to quantiles16 descriptor (default: False).",
+    )
+    p.add_argument(
+        "--hist_bins",
+        type=int,
+        default=32,
+        help="Histogram bins for hist32 descriptor (default: 32).",
+    )
+    p.add_argument(
+        "--hist_range",
+        type=float,
+        nargs=2,
+        default=[-3.0, 3.0],
+        metavar=("VMIN", "VMAX"),
+        help="Histogram intensity range [vmin vmax] on normalized image (default: -3 3).",
+    )
+    p.add_argument(
+        "--moments_trim_ratio",
+        type=float,
+        default=0.1,
+        help="Trim ratio for moments trimmed mean (default: 0.1 = 10%% each tail).",
+    )
+    p.add_argument(
+        "--sample_edges_for_sigma",
+        type=int,
+        default=50_000,
+        help="Max neighbor edges to sample when sigma_phi='median' (default: 50000).",
+    )
 
     args = p.parse_args()
 
@@ -172,7 +227,25 @@ def main() -> None:
         str(args.seed),
         "--num_workers",
         str(args.lp_num_workers),
+        "--descriptor_type",
+        str(args.descriptor_type),
     ]
+    if args.datalist:
+        cmd_lp += ["--datalist", str(args.datalist)]
+    if args.data_root:
+        cmd_lp += ["--data_root", str(args.data_root)]
+    if args.descriptor_cache_dir:
+        cmd_lp += ["--descriptor_cache_dir", str(args.descriptor_cache_dir)]
+    if args.use_cosine:
+        cmd_lp.append("--use_cosine")
+    if args.sigma_phi:
+        cmd_lp += ["--sigma_phi", str(args.sigma_phi)]
+    if args.quantiles_include_mad:
+        cmd_lp.append("--quantiles_include_mad")
+    cmd_lp += ["--hist_bins", str(args.hist_bins)]
+    cmd_lp += ["--hist_range", str(args.hist_range[0]), str(args.hist_range[1])]
+    cmd_lp += ["--moments_trim_ratio", str(args.moments_trim_ratio)]
+    cmd_lp += ["--sample_edges_for_sigma", str(args.sample_edges_for_sigma)]
     if args.use_outer_bg_split:
         cmd_lp.append("--use_outer_bg_split")
     _run(cmd_lp, "STEP 1: Graph LP propagation over supervoxels")

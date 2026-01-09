@@ -732,6 +732,12 @@ For Graph LP over SVs on the **new dataset** (single k, ROI-only LP, plus evalua
 python3 scripts/pipeline_graph_lp_sv.py --sv_dir runs/sv_fullgt_slic_n12000_new_ras --seeds_dir runs/strategic_sparse_0p1pct_new_outerbg/strategic_seeds --datalist datalist_train_new.json --data_root /data3/wp5_4_Dec_data/3ddl-dataset/data --output_dir runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg --k 10 --alpha 0.9 --num_classes 5 --seed 42 --use_outer_bg_split --lp_num_workers 16 --eval_num_workers 16 --eval_progress --eval_log_to_file --eval_heavy
 ```
 
+**Intensity-aware Graph LP (coords + intensity descriptors)**:
+- Graph construction can optionally include an intensity descriptor term in addition to the centroid-coordinate (spatial) term via `--descriptor_type {moments,quantiles16,hist32}`.
+- Old behavior (coords-only) remains available via `--descriptor_type none` (default).
+- Intensity descriptors require image access via `--datalist` (and `--data_root` if paths are relative). Histogram descriptors assume robust per-volume normalization (pclip+zscore) so `--hist_range -3 3` is meaningful.
+- For convenience (runs 3 descriptor variants sequentially + evaluates each vs GT), use: `bash scripts/run_graph_lp_3_descriptors_then_eval.sh`
+
 **Outputs**:
 - `cases/<case_id>/propagated_k01_labels.npy` - Dense labels for k=1
 - `cases/<case_id>/propagated_k03_labels.npy` - Dense labels for k=3

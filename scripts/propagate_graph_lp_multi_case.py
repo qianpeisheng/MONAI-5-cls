@@ -21,10 +21,11 @@ Outputs (per case):
 """
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Optional, Tuple
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -34,7 +35,21 @@ from tqdm import tqdm
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from wp5.weaklabel.graph_label_propagation import graph_label_propagation
+from wp5.weaklabel.graph_affinity import build_spatial_intensity_affinity
+from wp5.weaklabel.graph_label_propagation import (
+    graph_label_propagation,
+    graph_label_propagation_from_affinity,
+)
+from wp5.weaklabel.sv_descriptors import (
+    DescriptorConfig,
+    compute_sv_descriptor_hist,
+    compute_sv_descriptor_moments,
+    compute_sv_descriptor_quantiles,
+    descriptors_equal_unique_svs,
+    load_descriptor_cache,
+    pclip_zscore,
+    save_descriptor_cache,
+)
 from scripts.propagate_sv_labels_multi_k import compute_sv_centroids
 
 
@@ -75,6 +90,84 @@ def sv_flags_to_dense(sv_ids: np.ndarray, sv_flags: Dict[int, int]) -> np.ndarra
     return dense
 
 
+def _center_pad_or_crop(vol: np.ndarray, target_shape: Tuple[int, int, int]) -> np.ndarray:
+    """Center crop or zero-pad a 3D volume to match target_shape."""
+
+    out = vol
+    if out.ndim != 3:
+        raise ValueError(f"Expected 3D array, got shape={tuple(out.shape)}")
+
+    # Center-crop
+    for axis in range(3):
+        diff = out.shape[axis] - target_shape[axis]
+        if diff > 0:
+            start = diff // 2
+            end = start + target_shape[axis]
+            slicer = [slice(None)] * 3
+            slicer[axis] = slice(start, end)
+            out = out[tuple(slicer)]
+
+    # Center-pad
+    pad_width = []
+    for axis in range(3):
+        diff = target_shape[axis] - out.shape[axis]
+        if diff > 0:
+            left = diff // 2
+            right = diff - left
+            pad_width.append((left, right))
+        else:
+            pad_width.append((0, 0))
+    return np.pad(out, pad_width, mode="constant", constant_values=0)
+
+
+def _load_nii_ras_float(path: Path) -> np.ndarray:
+    try:
+        import nibabel as nib  # type: ignore
+    except Exception as e:  # pragma: no cover
+        raise RuntimeError(f"nibabel is required to read NIfTI: {e}")
+
+    img = nib.load(str(path))
+    try:
+        img = nib.as_closest_canonical(img)
+    except Exception:
+        pass
+    arr = np.asarray(img.get_fdata())
+    if arr.ndim == 4 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim == 4 and arr.shape[0] == 1:
+        arr = arr[0]
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D or 1x3D NIfTI, got shape {arr.shape} for {path}")
+    return arr.astype(np.float32)
+
+
+def _load_datalist_map(datalist_path: Path, data_root: Optional[Path]) -> Dict[str, str]:
+    records = json.loads(datalist_path.read_text())
+    out: Dict[str, str] = {}
+    for rec in records:
+        cid = rec.get("id")
+        ip = rec.get("image")
+        if not cid or not ip:
+            continue
+        ip_s = str(ip)
+        if data_root is not None and not Path(ip_s).is_absolute():
+            ip_s = str(data_root / ip_s)
+        out[str(cid)] = ip_s
+    return out
+
+
+def _descriptor_cache_path(
+    cache_dir: Path,
+    sv_dir: Path,
+    case_id: str,
+    cfg: DescriptorConfig,
+) -> Path:
+    sv_key = hashlib.sha1(str(sv_dir.resolve()).encode("utf-8")).hexdigest()[:10]
+    cfg_key = hashlib.sha1(cfg.key().encode("utf-8")).hexdigest()[:16]
+    sub = cache_dir / f"sv_{sv_key}" / f"{cfg.descriptor_type}_{cfg_key}"
+    return sub / f"{case_id}.npz"
+
+
 def propagate_case(
     case_id: str,
     sv_dir: Path,
@@ -84,6 +177,18 @@ def propagate_case(
     alpha: float,
     num_classes: int = 5,
     use_outer_bg_split: bool = False,
+    *,
+    descriptor_type: str = "none",
+    use_cosine: bool = False,
+    sigma_phi: str = "median",
+    quantiles_include_mad: bool = False,
+    hist_bins: int = 32,
+    hist_range: Tuple[float, float] = (-3.0, 3.0),
+    moments_trim_ratio: float = 0.1,
+    datalist_map: Optional[Dict[str, str]] = None,
+    descriptor_cache_dir: Optional[Path] = None,
+    sample_edges_for_sigma: int = 50_000,
+    seed: int = 42,
 ) -> Dict:
     """Process one case: load sparse labels, propagate with Graph LP, save."""
 
@@ -153,14 +258,111 @@ def propagate_case(
 
     # Run Graph LP only on ROI SVs; outer background SVs are later forced to 0.
     if N_roi > 0:
-        pred_sv_labels_roi = graph_label_propagation(
-            sv_features,
-            sv_labels_array,
-            num_classes,
-            k=k,
-            alpha=alpha,
-            sigma=None,  # Use median heuristic
-        )
+        if descriptor_type == "none":
+            pred_sv_labels_roi = graph_label_propagation(
+                sv_features,
+                sv_labels_array,
+                num_classes,
+                k=k,
+                alpha=alpha,
+                sigma=None,  # Use median heuristic
+            )
+        else:
+            if datalist_map is None or case_id not in datalist_map:
+                raise RuntimeError(
+                    f"descriptor_type={descriptor_type} requires --datalist with an image entry for case_id={case_id}"
+                )
+
+            img_path = Path(datalist_map[case_id])
+            if not img_path.exists():
+                raise FileNotFoundError(f"Image not found for {case_id}: {img_path}")
+
+            img = _load_nii_ras_float(img_path)
+            if img.shape != sv_ids.shape:
+                img = _center_pad_or_crop(img, tuple(int(x) for x in sv_ids.shape))
+
+            img = pclip_zscore(img)
+
+            cfg = DescriptorConfig(
+                descriptor_type=descriptor_type,  # type: ignore[arg-type]
+                quantiles_include_mad=bool(quantiles_include_mad),
+                hist_bins=int(hist_bins),
+                hist_range=(float(hist_range[0]), float(hist_range[1])),
+                moments_trim_ratio=float(moments_trim_ratio),
+                quantile_method="linear",
+                normalize="pclip_zscore",
+            )
+
+            phi_all = None
+            if descriptor_cache_dir is not None and str(descriptor_cache_dir):
+                cache_path = _descriptor_cache_path(descriptor_cache_dir, sv_dir, case_id, cfg)
+                if cache_path.exists():
+                    cached_unique, cached_phi = load_descriptor_cache(cache_path)
+                    if descriptors_equal_unique_svs(cached_unique, unique_svs):
+                        phi_all = cached_phi
+
+            if phi_all is None:
+                if descriptor_type == "moments":
+                    phi_all = compute_sv_descriptor_moments(
+                        sv_ids,
+                        img,
+                        unique_svs,
+                        trim_ratio=float(moments_trim_ratio),
+                        quantile_method="linear",
+                    )
+                elif descriptor_type == "quantiles16":
+                    phi_all = compute_sv_descriptor_quantiles(
+                        sv_ids,
+                        img,
+                        unique_svs,
+                        n_quantiles=16,
+                        include_mad=bool(quantiles_include_mad),
+                        quantile_method="linear",
+                    )
+                elif descriptor_type == "hist32":
+                    phi_all = compute_sv_descriptor_hist(
+                        sv_ids,
+                        img,
+                        unique_svs,
+                        bins=int(hist_bins),
+                        vmin=float(hist_range[0]),
+                        vmax=float(hist_range[1]),
+                    )
+                else:
+                    raise ValueError(f"Unknown descriptor_type: {descriptor_type}")
+
+                if descriptor_cache_dir is not None and str(descriptor_cache_dir):
+                    cache_path = _descriptor_cache_path(descriptor_cache_dir, sv_dir, case_id, cfg)
+                    save_descriptor_cache(cache_path, unique_svs=unique_svs, phi=phi_all)
+
+            phi = phi_all[roi_mask]
+
+            if descriptor_type == "hist32":
+                metric = "chi2"
+            else:
+                metric = "cosine" if bool(use_cosine) else "l2"
+
+            sigma_phi_arg = str(sigma_phi)
+            sigma_phi_val = "median" if sigma_phi_arg == "median" else float(sigma_phi_arg)
+
+            W = build_spatial_intensity_affinity(
+                centroids=sv_features,
+                phi=phi,
+                k=int(k),
+                sigma_phi=sigma_phi_val,
+                use_cosine=bool(use_cosine),
+                metric=metric,  # type: ignore[arg-type]
+                sigma_c=None,
+                sample_edges_for_sigma=int(sample_edges_for_sigma),
+                seed=int(seed),
+            )
+
+            pred_sv_labels_roi = graph_label_propagation_from_affinity(
+                W,
+                sv_labels_array,
+                num_classes,
+                alpha=float(alpha),
+            )
     else:
         pred_sv_labels_roi = np.zeros((0,), dtype=np.int64)
 
@@ -203,6 +405,9 @@ def propagate_case(
         "n_total_svs": int(N),
         "k": k,
         "alpha": alpha,
+        "descriptor_type": str(descriptor_type),
+        "use_cosine": bool(use_cosine),
+        "sigma_phi": str(sigma_phi),
         "sv_ids_shape": list(sv_ids.shape),
         "n_sv_with_gt": int(sv_has_gt_all.sum()),
         "n_sv_graph_only": int(N - sv_has_gt_all.sum()),
@@ -285,6 +490,73 @@ def main():
     parser.add_argument("--num_workers", type=int, default=1,
                         help="Number of parallel workers over cases (default: 1 = serial)")
     parser.add_argument(
+        "--descriptor_type",
+        type=str,
+        default="none",
+        choices=["none", "moments", "quantiles16", "hist32"],
+        help="Optional intensity descriptor for graph weights (default: none = coords-only).",
+    )
+    parser.add_argument(
+        "--datalist",
+        type=str,
+        default="",
+        help="MONAI-style datalist JSON with {image,label,id}. Required if --descriptor_type != none.",
+    )
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        default="",
+        help="Optional dataset root to resolve relative image paths in --datalist.",
+    )
+    parser.add_argument(
+        "--descriptor_cache_dir",
+        type=str,
+        default="",
+        help="Optional cache directory for computed SV descriptors (per sv_dir + descriptor config).",
+    )
+    parser.add_argument(
+        "--use_cosine",
+        action="store_true",
+        help="Use cosine distance for moments/quantiles descriptors (default: L2).",
+    )
+    parser.add_argument(
+        "--sigma_phi",
+        type=str,
+        default="median",
+        help="Descriptor kernel sigma: float or 'median' (default: median).",
+    )
+    parser.add_argument(
+        "--quantiles_include_mad",
+        action="store_true",
+        help="If set, append MAD to quantiles16 descriptor (default: False).",
+    )
+    parser.add_argument(
+        "--hist_bins",
+        type=int,
+        default=32,
+        help="Histogram bins for hist32 descriptor (default: 32).",
+    )
+    parser.add_argument(
+        "--hist_range",
+        type=float,
+        nargs=2,
+        default=[-3.0, 3.0],
+        metavar=("VMIN", "VMAX"),
+        help="Histogram intensity range [vmin vmax] on normalized image (default: -3 3).",
+    )
+    parser.add_argument(
+        "--moments_trim_ratio",
+        type=float,
+        default=0.1,
+        help="Trim ratio for moments trimmed mean (default: 0.1 = 10%% each tail).",
+    )
+    parser.add_argument(
+        "--sample_edges_for_sigma",
+        type=int,
+        default=50_000,
+        help="Max neighbor edges to sample when sigma_phi='median' (default: 50000).",
+    )
+    parser.add_argument(
         "--use_outer_bg_split",
         action="store_true",
         help=(
@@ -298,11 +570,24 @@ def main():
     # Set random seed
     np.random.seed(args.seed)
 
-    print(f"Graph LP parameters: k={args.k}, alpha={args.alpha}")
+    print(f"Graph LP parameters: k={args.k}, alpha={args.alpha}, descriptor_type={args.descriptor_type}")
 
     sv_dir = Path(args.sv_dir)
     seeds_dir = Path(args.seeds_dir)
     output_dir = Path(args.output_dir)
+
+    datalist_map = None
+    if args.descriptor_type != "none":
+        if not args.datalist:
+            raise SystemExit("--datalist is required when --descriptor_type != none")
+        datalist_map = _load_datalist_map(
+            Path(args.datalist),
+            Path(args.data_root) if args.data_root else None,
+        )
+        if not datalist_map:
+            raise SystemExit(f"No valid image entries found in datalist: {args.datalist}")
+
+    cache_dir = Path(args.descriptor_cache_dir) if args.descriptor_cache_dir else None
 
     # Find all cases from seeds directory
     sparse_label_files = list(seeds_dir.glob("*_sv_labels_sparse.json"))
@@ -326,6 +611,17 @@ def main():
                 alpha=args.alpha,
                 num_classes=args.num_classes,
                 use_outer_bg_split=args.use_outer_bg_split,
+                descriptor_type=str(args.descriptor_type),
+                use_cosine=bool(args.use_cosine),
+                sigma_phi=str(args.sigma_phi),
+                quantiles_include_mad=bool(args.quantiles_include_mad),
+                hist_bins=int(args.hist_bins),
+                hist_range=(float(args.hist_range[0]), float(args.hist_range[1])),
+                moments_trim_ratio=float(args.moments_trim_ratio),
+                datalist_map=datalist_map,
+                descriptor_cache_dir=cache_dir,
+                sample_edges_for_sigma=int(args.sample_edges_for_sigma),
+                seed=int(args.seed),
             )
             if meta:
                 all_meta.append(meta)
@@ -335,14 +631,25 @@ def main():
             futures = {
                 ex.submit(
                     propagate_case,
-                    case_id,
-                    sv_dir,
-                    seeds_dir,
-                    output_dir,
-                    args.k,
-                    args.alpha,
-                    args.num_classes,
-                    args.use_outer_bg_split,
+                    case_id=case_id,
+                    sv_dir=sv_dir,
+                    seeds_dir=seeds_dir,
+                    output_dir=output_dir,
+                    k=int(args.k),
+                    alpha=float(args.alpha),
+                    num_classes=int(args.num_classes),
+                    use_outer_bg_split=bool(args.use_outer_bg_split),
+                    descriptor_type=str(args.descriptor_type),
+                    use_cosine=bool(args.use_cosine),
+                    sigma_phi=str(args.sigma_phi),
+                    quantiles_include_mad=bool(args.quantiles_include_mad),
+                    hist_bins=int(args.hist_bins),
+                    hist_range=(float(args.hist_range[0]), float(args.hist_range[1])),
+                    moments_trim_ratio=float(args.moments_trim_ratio),
+                    datalist_map=datalist_map,
+                    descriptor_cache_dir=cache_dir,
+                    sample_edges_for_sigma=int(args.sample_edges_for_sigma),
+                    seed=int(args.seed),
                 ): case_id
                 for case_id in cases
             }
@@ -368,6 +675,12 @@ def main():
             "n_cases": len(all_meta),
             "k": args.k,
             "alpha": args.alpha,
+            "descriptor_type": str(args.descriptor_type),
+            "sigma_phi": str(args.sigma_phi),
+            "use_cosine": bool(args.use_cosine),
+            "quantiles_include_mad": bool(args.quantiles_include_mad),
+            "hist_bins": int(args.hist_bins),
+            "hist_range": [float(args.hist_range[0]), float(args.hist_range[1])],
             "avg_labeled_svs_input": float(avg_labeled),
             "avg_total_svs": float(avg_total),
             "avg_coverage_input": float(avg_labeled / avg_total),
