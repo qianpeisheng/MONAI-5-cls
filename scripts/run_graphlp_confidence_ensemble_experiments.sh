@@ -84,8 +84,8 @@ TRAIN_COMMON=(--mode train --data_root "${DATA_ROOT}" --split_cfg "${SPLIT_CFG}"
 # which makes it easier to tune/report than raw per-voxel weights.
 
 TS1="$(date +%Y%m%d-%H%M%S)"
-CUDA_VISIBLE_DEVICES=0 "${PY}" train_finetune_wp5.py "${TRAIN_COMMON[@]}" --train_label_override_dir runs/graph_lp_ens_vote_COMQ_tieQ/labels --train_label_agreement_dir runs/graph_lp_ens_vote_COMQ_tieQ --agree_gt_sentinel "${GT_SENTINEL}" --agree_weight_mode decoupled --agree_imbalance_scope dataset --agree_gamma_table "4:0.20,3:0.10,2:0.02,1:0.00" --output_dir "runs/train_graphlp_agree_COMQ_decoupled_gammaA_${TS1}_gpu0" &
-CUDA_VISIBLE_DEVICES=1 "${PY}" train_finetune_wp5.py "${TRAIN_COMMON[@]}" --train_label_override_dir runs/graph_lp_ens_vote_COMQ_tieQ/labels --train_label_agreement_dir runs/graph_lp_ens_vote_COMQ_tieQ --agree_gt_sentinel "${GT_SENTINEL}" --agree_weight_mode decoupled --agree_imbalance_scope dataset --agree_gamma_table "4:0.30,3:0.15,2:0.03,1:0.00" --output_dir "runs/train_graphlp_agree_COMQ_decoupled_gammaB_${TS1}_gpu1" &
+CUDA_VISIBLE_DEVICES=0 "${PY}" train_finetune_wp5.py "${TRAIN_COMMON[@]}" --train_label_override_dir runs/graph_lp_ens_vote_COMQ_tieQ/labels --train_label_agreement_dir runs/graph_lp_ens_vote_COMQ_tieQ --agree_gt_sentinel "${GT_SENTINEL}" --agree_weight_mode decoupled --agree_imbalance_scope dataset --agree_gamma_table "4:0.20,3:0.10,2:0.00,1:0.00" --output_dir "runs/train_graphlp_agree_COMQ_decoupled_gammaA_${TS1}_gpu0" &
+CUDA_VISIBLE_DEVICES=1 "${PY}" train_finetune_wp5.py "${TRAIN_COMMON[@]}" --train_label_override_dir runs/graph_lp_ens_vote_COMQ_tieQ/labels --train_label_agreement_dir runs/graph_lp_ens_vote_COMQ_tieQ --agree_gt_sentinel "${GT_SENTINEL}" --agree_weight_mode decoupled --agree_imbalance_scope dataset --agree_gamma_table "4:0.30,3:0.15,2:0.02,1:0.00" --output_dir "runs/train_graphlp_agree_COMQ_decoupled_gammaB_${TS1}_gpu1" &
 wait
 
 TS2="$(date +%Y%m%d-%H%M%S)"
