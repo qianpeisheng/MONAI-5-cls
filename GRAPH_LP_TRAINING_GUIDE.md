@@ -182,6 +182,27 @@ python3 train_finetune_wp5.py \
   --output_dir runs/train_graph_lp_k10_a0.9_0p1pct
 ```
 
+### Command (ensemble pseudo labels + agreement-count weighting)
+
+If you have multiple pseudo-label runs and want to **ensemble** them while keeping *raw agreement counts* for training-time reliability control:
+
+1) Build an ensemble pseudo-label set (writes `labels/` + `agreement/`):
+
+```bash
+python3 scripts/build_graph_lp_ensemble_labels.py --datalist datalist_train_new.json --out_dir runs/graph_lp_ens_vote_COMQ_tieQ --label_dir C=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000 --label_dir O=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive --label_dir M=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/moments --label_dir Q=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16 --tie_break Q --seed_source_mask_dir runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16/source_masks --write_source_masks
+```
+
+2) Train with agreement-count weighting (example, K=4):
+
+```bash
+python3 train_finetune_wp5.py --mode train --data_root /data3/wp5_4_Dec_data/3ddl-dataset --split_cfg /data3/wp5_4_Dec_data/3ddl-dataset/data/dataset_config.json --train_label_override_dir runs/graph_lp_ens_vote_COMQ_tieQ/labels --train_label_agreement_dir runs/graph_lp_ens_vote_COMQ_tieQ --agree_weight_mode decoupled --agree_imbalance_scope dataset --agree_gamma_table "4:0.20,3:0.10,2:0.02,1:0.00" --output_dir runs/train_graphlp_agree_COMQ
+```
+
+Notes:
+- `agreement/<id>_agree_count.npy` stores raw agreement counts for pseudo voxels (`1..K`).
+- Voxels in seed-supported SVs (from the input `source_masks/`) are encoded as `agree_count=255` (GT tier).
+- Thresholding/weighting decisions belong to training (`--agree_*`), not the builder.
+
 ### Key Arguments
 
 | Argument | Value | Explanation |
@@ -191,6 +212,11 @@ python3 train_finetune_wp5.py \
 | `--source_weight_mode` | decoupled | `raw`: use `--source_weight_lp` directly. `decoupled`: separate imbalance normalization from pseudo-label confidence. |
 | `--source_imbalance_scope` | dataset | `dataset`: compute fixed ratio `r=N_gt/N_lp` from all source masks once. `batch`: compute `r` per cropped batch (fast) with dataset fallback. |
 | `--source_lp_quality` | 0.2 | `gamma` in `[0.1,1]` (recommended) controlling how much confidence to place on graph-only SV labels after normalization. |
+| `--train_label_agreement_dir` | Path to agreement maps | Per-voxel `agree_count` for ensemble pseudo labels (1..K; 255=GT tier). |
+| `--agree_weight_mode` | decoupled | `table`: explicit `count->weight`. `decoupled`: `w_c=(N_gt/N_c)*gamma_c` per count. |
+| `--agree_weight_table` | (example) | For `table`: e.g. `"4:0.2,3:0.1,2:0.02,1:0.0"` |
+| `--agree_gamma_table` | (example) | For `decoupled`: e.g. `"4:0.2,3:0.1,2:0.02,1:0.0"` |
+| `--agree_imbalance_scope` | dataset | `dataset`: fixed weights from whole train set. `batch`: per-batch weights with dataset fallback. |
 | `--output_dir` | Training output dir | Checkpoints and logs saved here |
 | `--epochs` | (default 40) | Total training epochs (use script default unless you need a shorter run) |
 | `--batch_size` | (default 4) | Adjust based on GPU memory if needed |

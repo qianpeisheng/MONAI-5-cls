@@ -5,17 +5,18 @@ Build an ensemble (majority-vote) pseudo-label set from multiple Graph-LP label 
 Outputs are written in a Graph-LP-like structure:
   <out_dir>/
     labels/<id>_labels.npy
-    source_masks/<id>_source.npy        (optional; confidence/seed-based)
-    confidence/<id>_maxc.npy            (optional; per-voxel max vote count)
+    agreement/<id>_agree_count.npy      (per-voxel max vote count; GT tier encoded as gt_sentinel)
+    source_masks/<id>_source.npy        (optional; copied/pass-through seed-support mask)
+    confidence/<id>_maxc.npy            (optional alias of agreement/<id>_agree_count.npy; legacy)
     propagation_summary.json            (describes how this ensemble was built)
 
 Notes:
   - This script does NOT require running Graph LP again; it just combines saved labels.
-  - If you set low-confidence voxels to ignore label (6), do NOT evaluate with
-    scripts/eval_sv_voted_wp5.py directly, because it only ignores GT==6, not pred==6.
+  - Reliability thresholding should be done in the training code (via agree_count weighting),
+    not in this builder. The builder records raw agreement counts.
 
 Example (vote 4 runs, tie-break by Q, and mark voxels with maxc>=3 as reliable):
-  python3 scripts/build_graph_lp_ensemble_labels.py --datalist datalist_train_new.json --out_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ_thr3 --label_dir C=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000 --label_dir O=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive --label_dir M=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/moments --label_dir Q=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16 --tie_break Q --seed_source_mask_dir runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16/source_masks --confidence_threshold 3 --write_source_masks --write_confidence_maps
+  python3 scripts/build_graph_lp_ensemble_labels.py --datalist datalist_train_new.json --out_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ --label_dir C=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000 --label_dir O=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive --label_dir M=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/moments --label_dir Q=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16 --tie_break Q --seed_source_mask_dir runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16/source_masks
 """
 
 from __future__ import annotations
@@ -99,19 +100,21 @@ def _majority_vote(labels: Sequence[np.ndarray], tie_break: np.ndarray) -> Tuple
     return vote, maxc.astype(np.uint8)
 
 
-def main() -> None:
+def main(argv: Sequence[str] | None = None) -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--datalist", type=str, required=True, help="Datalist JSON used to enumerate case IDs")
     ap.add_argument("--out_dir", type=str, required=True)
     ap.add_argument("--label_dir", action="append", required=True, help="NAME=PATH (run dir or labels dir). Repeatable.")
     ap.add_argument("--tie_break", type=str, required=True, help="Label NAME used for tie-breaking")
     ap.add_argument("--seed_source_mask_dir", type=str, default="", help="Optional dir with <id>_source.npy to OR into output source masks")
-    ap.add_argument("--confidence_threshold", type=int, default=0, help="If >0, mark voxels with maxc>=thr as reliable in source mask")
+    ap.add_argument("--gt_sentinel", type=int, default=255, help="agree_count value reserved for GT-supported voxels (default: 255)")
     ap.add_argument("--write_source_masks", action="store_true", help="Write out_dir/source_masks/<id>_source.npy")
-    ap.add_argument("--write_confidence_maps", action="store_true", help="Write out_dir/confidence/<id>_maxc.npy")
-    ap.add_argument("--write_filtered_labels", action="store_true", help="Also write labels_filtered/<id>_labels.npy with low-confidence voxels set to ignore_label")
-    ap.add_argument("--ignore_label", type=int, default=6, help="Used only for --write_filtered_labels")
-    args = ap.parse_args()
+    ap.add_argument(
+        "--write_confidence_maps",
+        action="store_true",
+        help="[Legacy] Also write out_dir/confidence/<id>_maxc.npy as an alias of agreement/<id>_agree_count.npy.",
+    )
+    args = ap.parse_args(argv)
 
     datalist = Path(args.datalist)
     out_dir = Path(args.out_dir)
@@ -127,33 +130,29 @@ def main() -> None:
 
     labels_out = out_dir / "labels"
     labels_out.mkdir(parents=True, exist_ok=True)
-    conf_out = out_dir / "confidence"
     src_out = out_dir / "source_masks"
-    filt_out = out_dir / "labels_filtered"
+    agree_out = out_dir / "agreement"
+    agree_out.mkdir(parents=True, exist_ok=True)
+    conf_out = out_dir / "confidence"
 
     if args.write_confidence_maps:
         conf_out.mkdir(parents=True, exist_ok=True)
     if args.write_source_masks:
         src_out.mkdir(parents=True, exist_ok=True)
-        if not args.seed_source_mask_dir and args.confidence_threshold <= 0:
-            raise SystemExit("--write_source_masks requires --seed_source_mask_dir or --confidence_threshold>0.")
-    if args.write_filtered_labels:
-        if args.confidence_threshold <= 0:
-            raise SystemExit("--write_filtered_labels requires --confidence_threshold>0.")
-        filt_out.mkdir(parents=True, exist_ok=True)
 
     seed_src_dir = Path(args.seed_source_mask_dir) if args.seed_source_mask_dir else None
-    thr = int(args.confidence_threshold)
+    gt_sentinel = int(args.gt_sentinel)
 
     # Build summary for provenance
+    K = len(label_dirs)
     summary = {
         "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "datalist": str(datalist),
         "label_dirs": {k: str(v) for k, v in label_dirs_raw.items()},
+        "K": int(K),
         "tie_break": args.tie_break,
         "seed_source_mask_dir": str(seed_src_dir) if seed_src_dir is not None else "",
-        "confidence_threshold": thr,
-        "ignore_label_for_filtered": int(args.ignore_label),
+        "gt_sentinel": int(gt_sentinel),
         "n_cases": len(case_ids),
     }
     (out_dir / "propagation_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
@@ -161,12 +160,11 @@ def main() -> None:
     print(f"Cases: {len(case_ids)}")
     print(f"Out: {out_dir}")
     print(f"Labels: {labels_out}")
+    print(f"Agreement: {agree_out}")
     if args.write_source_masks:
         print(f"Source masks: {src_out}")
     if args.write_confidence_maps:
         print(f"Confidence: {conf_out}")
-    if args.write_filtered_labels:
-        print(f"Filtered labels: {filt_out} (low-confidence -> {int(args.ignore_label)})")
 
     for i, cid in enumerate(case_ids):
         # Load all label arrays for this case
@@ -193,8 +191,25 @@ def main() -> None:
 
         np.save(str(labels_out / f"{cid}_labels.npy"), vote.astype(np.int16, copy=False))
 
+        # Encode GT-supported voxels (if provided) as a special high-count sentinel.
+        agree_count = maxc.astype(np.uint8, copy=False)
+        if seed_src_dir is not None:
+            sp = seed_src_dir / f"{cid}_source.npy"
+            if not sp.exists():
+                raise FileNotFoundError(f"Missing seed source mask: {sp}")
+            s = np.load(str(sp))
+            if s.ndim == 4 and s.shape[0] == 1:
+                s = s[0]
+            if tuple(s.shape) != target_shape:
+                s = _center_pad_or_crop(s.astype(np.uint8), target_shape)  # type: ignore[arg-type]
+            agree_count = agree_count.copy()
+            agree_count[s.astype(bool)] = np.uint8(gt_sentinel)
+
+        np.save(str(agree_out / f"{cid}_agree_count.npy"), agree_count.astype(np.uint8, copy=False))
+
+        # Optional legacy alias for older scripts.
         if args.write_confidence_maps:
-            np.save(str(conf_out / f"{cid}_maxc.npy"), maxc.astype(np.uint8, copy=False))
+            np.save(str(conf_out / f"{cid}_maxc.npy"), agree_count.astype(np.uint8, copy=False))
 
         if args.write_source_masks:
             src = np.zeros(target_shape, dtype=np.uint8)
@@ -208,22 +223,7 @@ def main() -> None:
                 if tuple(s.shape) != target_shape:
                     s = _center_pad_or_crop(s.astype(np.uint8), target_shape)  # type: ignore[arg-type]
                 src |= (s.astype(bool)).astype(np.uint8)
-            if thr > 0:
-                src |= (maxc >= thr).astype(np.uint8)
             np.save(str(src_out / f"{cid}_source.npy"), src.astype(np.uint8, copy=False))
-
-        if args.write_filtered_labels:
-            # Low-confidence voxels set to ignore label. Seeded voxels (if available) are always kept.
-            assert thr > 0
-            keep = (maxc >= thr)
-            if seed_src_dir is not None:
-                s = np.load(str(seed_src_dir / f"{cid}_source.npy")).astype(bool)
-                if tuple(s.shape) != target_shape:
-                    s = _center_pad_or_crop(s.astype(np.uint8), target_shape).astype(bool)  # type: ignore[arg-type]
-                keep |= s
-            filtered = vote.copy()
-            filtered[~keep] = int(args.ignore_label)
-            np.save(str(filt_out / f"{cid}_labels.npy"), filtered.astype(np.int16, copy=False))
 
         if (i + 1) % 200 == 0:
             print(f"  processed {i+1}/{len(case_ids)}")
@@ -233,4 +233,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

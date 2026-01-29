@@ -922,6 +922,41 @@ class LoadLabelSourceD(MapTransform):
         return d
 
 
+class LoadLabelAgreeCountD(MapTransform):
+    """Load per-voxel agreement-count maps (ensemble vote counts) by case id.
+
+    Expects files saved as <dir>/<id>_agree_count.npy with shape (X,Y,Z) or (1,X,Y,Z).
+    Values are interpreted as uint8 agreement counts:
+      - 1..K: raw #voters agreeing with the chosen label
+      - gt_sentinel (default 255): GT-supported tier (SV contains >=1 GT seed voxel)
+    """
+
+    def __init__(self, keys: list[str], id_key: str, dir_path: str):
+        super().__init__(keys)
+        self.id_key = id_key
+        self.dir = Path(dir_path) if dir_path else None
+
+    def __call__(self, data):
+        import numpy as np
+
+        d = dict(data)
+        if not self.dir:
+            return d
+        case_id = d.get(self.id_key)
+        if isinstance(case_id, list) and case_id:
+            case_id = case_id[0]
+        if case_id is None:
+            return d
+        safe_id = str(case_id).replace("/", "_")
+        p = self.dir / f"{safe_id}_agree_count.npy"
+        if p.exists():
+            arr = np.load(p)
+            if arr.ndim == 3:
+                arr = arr[None, ...]
+            d["agree_count"] = arr.astype(np.uint8, copy=False)
+        return d
+
+
 def get_transforms(
     roi=(112, 112, 80),
     norm: str = "clip_zscore",
@@ -943,6 +978,7 @@ def get_transforms(
     fp_no_overlap: bool = False,
     save_sup_masks_dir: str | None = None,
     label_source_dir: str | None = None,
+    label_agreement_dir: str | None = None,
 ):
     norm_transform = None
     if norm == "clip_zscore":
@@ -967,6 +1003,9 @@ def get_transforms(
         # Load per-voxel label source masks (Graph LP reliability) after orientation
         if training and label_source_dir:
             seq.append(LoadLabelSourceD(keys=["label"], id_key="id", dir_path=label_source_dir))
+        # Load per-voxel agreement-count maps (ensemble confidence) after orientation
+        if training and label_agreement_dir:
+            seq.append(LoadLabelAgreeCountD(keys=["label"], id_key="id", dir_path=label_agreement_dir))
         if norm_transform is not None:
             seq.append(norm_transform)
         # Only pad during training to support fixed-size crops.
@@ -978,6 +1017,8 @@ def get_transforms(
                 base_pad_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
             if label_source_dir:
                 base_pad_keys.append("label_source")
+            if label_agreement_dir:
+                base_pad_keys.append("agree_count")
             pad_keys = base_pad_keys
             # Allow optional keys to be absent (e.g., pseudo_label may not exist for sparse points)
             seq.append(SpatialPadd(keys=pad_keys, spatial_size=roi, allow_missing_keys=True))
@@ -996,6 +1037,8 @@ def get_transforms(
                 base_flip_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
             if label_source_dir:
                 base_flip_keys.append("label_source")
+            if label_agreement_dir:
+                base_flip_keys.append("agree_count")
             flip_keys = base_flip_keys
             seq.extend([
                 RandFlipd(keys=flip_keys, spatial_axis=0, prob=0.5, allow_missing_keys=True),
@@ -1009,6 +1052,8 @@ def get_transforms(
                     base_crop_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
                 if label_source_dir:
                     base_crop_keys.append("label_source")
+                if label_agreement_dir:
+                    base_crop_keys.append("agree_count")
                 crop_keys = base_crop_keys
                 # Custom crop transform already tolerates missing keys
                 seq.append(FGBiasedCropD(keys=crop_keys, roi_size=roi, prob=fg_crop_prob, margin=fg_crop_margin))
@@ -1018,6 +1063,8 @@ def get_transforms(
                     base_crop_keys += ["sup_mask", "seed_mask", "pseudo_label", "valid_mask"]
                 if label_source_dir:
                     base_crop_keys.append("label_source")
+                if label_agreement_dir:
+                    base_crop_keys.append("agree_count")
                 crop_keys = base_crop_keys
                 seq.append(RandSpatialCropd(keys=crop_keys, roi_size=roi, random_size=False, allow_missing_keys=True))
         return seq
@@ -1350,6 +1397,164 @@ def compute_label_source_gt_to_lp_ratio_batch(
     if n_gt == 0 or n_lp == 0:
         return float(fallback_ratio)
     return float(n_gt / n_lp)
+
+
+def parse_int_float_table(spec: str) -> Dict[int, float]:
+    """Parse a compact int->float mapping string like: "1:0,2:0.02,4:1".
+
+    - Empty/whitespace spec returns {}.
+    - Duplicate keys raise ValueError.
+    """
+    s = str(spec or "").strip()
+    if not s:
+        return {}
+    out: Dict[int, float] = {}
+    for item in s.split(","):
+        it = item.strip()
+        if not it:
+            continue
+        if ":" not in it:
+            raise ValueError(f"Expected 'K:V' pairs separated by commas, got: {item!r}")
+        k_str, v_str = it.split(":", 1)
+        k = int(k_str.strip())
+        v = float(v_str.strip())
+        if k in out:
+            raise ValueError(f"Duplicate key {k} in table: {spec!r}")
+        out[k] = v
+    return out
+
+
+def build_agree_weight_map_table(
+    agree_count: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    weight_table: Dict[int, float],
+    gt_sentinel: int = 255,
+    gt_weight: float = 1.0,
+) -> torch.Tensor:
+    """Build a per-voxel weight map from a table mapping agree_count->weight.
+
+    - agree_count: (B,1,...) integer-like tensor.
+    - valid_mask: optional boolean mask selecting voxels to include (e.g., label!=6).
+    - weight_table: mapping from count -> weight for pseudo voxels (typically counts 1..K).
+    - gt_sentinel: value representing the GT-supported tier; always mapped to gt_weight.
+    - Any count not listed in weight_table (and not gt_sentinel) maps to 0.
+    """
+    ac = agree_count
+    if valid_mask is None:
+        valid = torch.ones_like(ac, dtype=torch.bool)
+    else:
+        valid = valid_mask.to(dtype=torch.bool)
+
+    w = torch.zeros_like(ac, dtype=torch.float32)
+    # GT tier
+    gt_mask = (ac == int(gt_sentinel)) & valid
+    if gt_mask.any():
+        w = torch.where(gt_mask, torch.full_like(w, float(gt_weight)), w)
+    # Pseudo tiers
+    for c, v in weight_table.items():
+        cm = (ac == int(c)) & valid
+        if cm.any():
+            w = torch.where(cm, torch.full_like(w, float(v)), w)
+    return w
+
+
+def build_agree_weight_map_decoupled(
+    agree_count: torch.Tensor,
+    valid_mask: torch.Tensor | None,
+    gamma_table: Dict[int, float],
+    gt_sentinel: int = 255,
+    gt_weight: float = 1.0,
+    fallback_w_by_count: Dict[int, float] | None = None,
+) -> torch.Tensor:
+    """Build a per-voxel weight map using the decoupled-by-count scheme.
+
+    For each count tier c (typically 1..K), define:
+      w_gt = gt_weight (fixed)
+      w_c = (N_gt / N_c) * gamma_c * w_gt
+
+    Where N_gt is the number of voxels with agree_count==gt_sentinel and N_c is the number
+    of voxels with agree_count==c, both counted within valid_mask (if provided).
+
+    Degenerate batches (N_gt==0 or N_c==0) fall back to fallback_w_by_count[c] when provided,
+    otherwise use 0.0 for that tier.
+    """
+    ac = agree_count
+    if valid_mask is None:
+        valid = torch.ones_like(ac, dtype=torch.bool)
+    else:
+        valid = valid_mask.to(dtype=torch.bool)
+
+    w = torch.zeros_like(ac, dtype=torch.float32)
+    gt_mask = (ac == int(gt_sentinel)) & valid
+    n_gt = int(gt_mask.sum().item())
+    if gt_mask.any():
+        w = torch.where(gt_mask, torch.full_like(w, float(gt_weight)), w)
+
+    for c, gamma_c in gamma_table.items():
+        cm = (ac == int(c)) & valid
+        n_c = int(cm.sum().item())
+        if n_gt > 0 and n_c > 0:
+            w_c = float(gt_weight) * (float(n_gt) / float(n_c)) * float(gamma_c)
+        else:
+            w_c = float(fallback_w_by_count.get(int(c), 0.0) if fallback_w_by_count is not None else 0.0)
+        if cm.any():
+            w = torch.where(cm, torch.full_like(w, float(w_c)), w)
+    return w
+
+
+def compute_agree_count_stats_from_dir(
+    agreement_dir: Path,
+    case_ids: list[str] | None = None,
+    gt_sentinel: int = 255,
+) -> Dict[str, object]:
+    """Compute dataset-level stats for agreement-count maps (<id>_agree_count.npy).
+
+    Returns counts over *all voxels* (no label==6 masking here; apply that at training time):
+      - n_gt_voxels: #voxels with agree_count==gt_sentinel (GT tier)
+      - n_by_count: mapping count->#voxels for pseudo tiers (counts not in {0, gt_sentinel})
+      - n_total_voxels
+    """
+    ad = Path(agreement_dir)
+    if (ad / "agreement").is_dir():
+        ad = ad / "agreement"
+    if not ad.exists():
+        raise FileNotFoundError(f"Agreement dir not found: {agreement_dir}")
+
+    if case_ids is None:
+        files = sorted(ad.glob("*_agree_count.npy"))
+    else:
+        files = []
+        for cid in case_ids:
+            safe_id = str(cid).replace("/", "_")
+            p = ad / f"{safe_id}_agree_count.npy"
+            if not p.exists():
+                raise FileNotFoundError(f"Missing agree_count file: {p}")
+            files.append(p)
+
+    n_gt = 0
+    n_total = 0
+    n_by_count: Dict[int, int] = {}
+
+    for p in files:
+        arr = np.load(p, mmap_mode="r")
+        if getattr(arr, "ndim", 0) == 4:
+            arr = arr[0]
+        a = np.asarray(arr, dtype=np.uint8)
+        bc = np.bincount(a.reshape(-1), minlength=256)
+        n_total += int(a.size)
+        n_gt += int(bc[int(gt_sentinel)])
+        for c in range(256):
+            if c == 0 or c == int(gt_sentinel):
+                continue
+            cnt = int(bc[c])
+            if cnt > 0:
+                n_by_count[c] = n_by_count.get(c, 0) + cnt
+
+    return {
+        "n_gt_voxels": int(n_gt),
+        "n_total_voxels": int(n_total),
+        "n_by_count": {int(k): int(v) for k, v in sorted(n_by_count.items(), key=lambda kv: kv[0])},
+    }
 
 
 def compute_metrics(
@@ -2044,6 +2249,101 @@ def train(args):
             print(f"effective mass ratio q = (w_lp*N_lp)/(w_gt*N_gt): {q:.6f} (expected ~ gamma)")
         print("=" * 60 + "\n")
 
+    # Agreement-count weighting for pseudo-label ensembles (few_samples only; requires --train_label_agreement_dir)
+    agree_gt_sentinel = int(getattr(args, "agree_gt_sentinel", 255))
+    agree_weight_mode = str(getattr(args, "agree_weight_mode", "table"))
+    agree_imbalance_scope = str(getattr(args, "agree_imbalance_scope", "dataset"))
+    agree_weight_table = parse_int_float_table(str(getattr(args, "agree_weight_table", "")))
+    agree_gamma_table = parse_int_float_table(str(getattr(args, "agree_gamma_table", "")))
+
+    # Resolve agreement dir once so transforms can load <id>_agree_count.npy directly.
+    agree_dir_resolved: Path | None = None
+    agree_stats_data: Dict[str, object] | None = None
+    agree_w_by_count_data: Dict[int, float] | None = None
+    if getattr(args, "train_label_agreement_dir", "") != "" and args.fewshot_mode == "few_samples":
+        agree_dir_resolved = Path(str(getattr(args, "train_label_agreement_dir")))
+        if (agree_dir_resolved / "agreement").is_dir():
+            agree_dir_resolved = agree_dir_resolved / "agreement"
+        if not agree_dir_resolved.exists():
+            raise FileNotFoundError(f"--train_label_agreement_dir not found: {agree_dir_resolved}")
+
+        if agree_weight_mode == "table":
+            if not agree_weight_table:
+                raise SystemExit(
+                    "--train_label_agreement_dir is set but --agree_weight_table is empty. "
+                    "Provide a mapping like: --agree_weight_table \"1:0,2:0.02,3:0.1,4:0.2\""
+                )
+        elif agree_weight_mode == "decoupled":
+            if not agree_gamma_table:
+                raise SystemExit(
+                    "--train_label_agreement_dir is set but --agree_gamma_table is empty. "
+                    "Provide a mapping like: --agree_gamma_table \"1:0,2:0.01,3:0.05,4:0.1\""
+                )
+        else:
+            raise ValueError(f"Unknown --agree_weight_mode: {agree_weight_mode}")
+
+        case_ids = [str(d.get("id")) for d in train_list if d.get("id") is not None]
+        agree_stats_data = compute_agree_count_stats_from_dir(
+            agreement_dir=agree_dir_resolved,
+            case_ids=case_ids,
+            gt_sentinel=agree_gt_sentinel,
+        )
+
+        # Try to load K metadata for reporting (optional).
+        meta_root = agree_dir_resolved.parent
+        meta_path = None
+        for fname in ("propagation_summary.json", "ensemble_summary.json"):
+            p = meta_root / fname
+            if p.exists():
+                meta_path = p
+                break
+        meta_k = None
+        if meta_path is not None:
+            try:
+                meta = json.loads(meta_path.read_text())
+                meta_k = int(meta.get("K")) if meta.get("K") is not None else None
+            except Exception:
+                meta_k = None
+
+        # Precompute dataset-level decoupled weights as a fallback and/or fixed weights for scope=dataset.
+        q_by_count: Dict[int, float | None] | None = None
+        if agree_weight_mode == "decoupled":
+            n_gt = int(agree_stats_data.get("n_gt_voxels", 0)) if agree_stats_data is not None else 0
+            n_by_count_raw = agree_stats_data.get("n_by_count", {}) if agree_stats_data is not None else {}
+            n_by_count = {int(k): int(v) for k, v in dict(n_by_count_raw).items()}  # type: ignore[arg-type]
+            agree_w_by_count_data = {}
+            q_by_count = {}
+            for c, gamma_c in agree_gamma_table.items():
+                n_c = int(n_by_count.get(int(c), 0))
+                if n_gt > 0 and n_c > 0:
+                    w_c = float(w_gt) * (float(n_gt) / float(n_c)) * float(gamma_c)
+                    q = (w_c * float(n_c) / (float(w_gt) * float(n_gt))) if (n_gt > 0) else None
+                else:
+                    w_c = 0.0
+                    q = None
+                agree_w_by_count_data[int(c)] = float(w_c)
+                q_by_count[int(c)] = q
+
+        # Persist stats for debugging/tuning.
+        try:
+            payload = {
+                "agreement_dir": str(agree_dir_resolved),
+                "gt_sentinel": int(agree_gt_sentinel),
+                "K": meta_k,
+                "agree_weight_mode": str(agree_weight_mode),
+                "agree_imbalance_scope": str(agree_imbalance_scope),
+                "agree_weight_table": {int(k): float(v) for k, v in agree_weight_table.items()},
+                "agree_gamma_table": {int(k): float(v) for k, v in agree_gamma_table.items()},
+                "n_gt_voxels": int(agree_stats_data.get("n_gt_voxels", 0)) if agree_stats_data is not None else 0,
+                "n_total_voxels": int(agree_stats_data.get("n_total_voxels", 0)) if agree_stats_data is not None else 0,
+                "n_by_count": agree_stats_data.get("n_by_count", {}) if agree_stats_data is not None else {},
+                "w_by_count_dataset": {int(k): float(v) for k, v in (agree_w_by_count_data or {}).items()},
+                "q_by_count_dataset": {int(k): (None if (q_by_count is None) else q_by_count.get(int(k))) for k in (agree_w_by_count_data or {}).keys()},
+            }
+            (out_dir / "metrics" / "agreement_stats.json").write_text(json.dumps(payload, indent=2))
+        except Exception:
+            pass
+
     # Transforms and datasets
     # Where to save/load static supervision masks
     if getattr(args, "sup_masks_dir", ""):
@@ -2122,6 +2422,7 @@ def train(args):
         fp_no_overlap=args.fp_no_overlap,
         save_sup_masks_dir=save_masks_dir,
         label_source_dir=getattr(args, "train_label_source_dir", None) or None,
+        label_agreement_dir=str(agree_dir_resolved) if agree_dir_resolved is not None else None,
     )
     ds_train = Dataset(train_list, transform=t_train)
     dl_train = DataLoader(
@@ -2210,49 +2511,95 @@ def train(args):
             lbl = batch["label"].long().to(device)  # (B,1,...)
             ignore_mask = (lbl != 6)
 
-            # Optional per-voxel reliability weights from Graph LP source masks.
-            # Only used in standard few_samples mode; ignored for few_points/few_slices.
-            use_source_weights = (
-                getattr(args, "train_label_source_dir", "") != ""
+            # Optional per-voxel reliability weights for pseudo-label training.
+            # Priority: agreement-count weights (multi-level) > legacy binary source masks.
+            use_agree_weights = (
+                getattr(args, "train_label_agreement_dir", "") != ""
                 and args.fewshot_mode == "few_samples"
-                and ("label_source" in batch)
+                and ("agree_count" in batch)
             )
-            if use_source_weights:
-                src = batch["label_source"].to(device).float()  # (B,1,X,Y,Z)
-                if source_weight_mode == "raw":
-                    # Legacy behavior: directly weight LP-only voxels by --source_weight_lp (GT weight fixed to 1.0).
-                    w_lp_eff = float(getattr(args, "source_weight_lp", 1.0))
-                elif source_weight_mode == "decoupled":
-                    # Decouple imbalance normalization from pseudo-label confidence:
-                    #   r = N_gt/N_lp (dataset or batch)
-                    #   gamma = --source_lp_quality (tunable, ideally 0.1..1 for reviewer-friendly reporting)
-                    #   w_lp_eff = w_gt * r * gamma
-                    if source_imbalance_scope == "batch":
-                        r_batch = compute_label_source_gt_to_lp_ratio_batch(
-                            src=src,
-                            valid_mask=ignore_mask,
-                            fallback_ratio=ratio_gt_to_lp_data,
-                        )
-                        src_r_sum += float(r_batch)
-                        src_r_n += 1
-                        src_r_min = float(r_batch) if src_r_min is None else min(src_r_min, float(r_batch))
-                        src_r_max = float(r_batch) if src_r_max is None else max(src_r_max, float(r_batch))
-                        r = float(r_batch)
-                    elif source_imbalance_scope == "dataset":
-                        r = float(ratio_gt_to_lp_data)
-                    else:
-                        raise ValueError(f"Unknown --source_imbalance_scope: {source_imbalance_scope}")
-                    w_lp_eff = float(w_gt) * float(r) * float(source_lp_quality)
-                else:
-                    raise ValueError(f"Unknown --source_weight_mode: {source_weight_mode}")
+            if use_agree_weights:
+                ac = batch["agree_count"].to(device)
+                # Optional: if a label_source mask is also present, treat label_source==1 as GT tier.
+                if getattr(args, "train_label_source_dir", "") != "" and ("label_source" in batch):
+                    src = batch["label_source"].to(device).float()
+                    ac = ac.clone()
+                    ac[src > 0.5] = int(agree_gt_sentinel)
 
-                label_source_weights = torch.where(
-                    src > 0.5,
-                    torch.ones_like(src) * float(w_gt),
-                    torch.ones_like(src) * float(w_lp_eff),
-                )
+                if agree_weight_mode == "table":
+                    voxel_weights = build_agree_weight_map_table(
+                        agree_count=ac,
+                        valid_mask=ignore_mask,
+                        weight_table=agree_weight_table,
+                        gt_sentinel=agree_gt_sentinel,
+                        gt_weight=w_gt,
+                    )
+                elif agree_weight_mode == "decoupled":
+                    if agree_imbalance_scope == "batch":
+                        voxel_weights = build_agree_weight_map_decoupled(
+                            agree_count=ac,
+                            valid_mask=ignore_mask,
+                            gamma_table=agree_gamma_table,
+                            gt_sentinel=agree_gt_sentinel,
+                            gt_weight=w_gt,
+                            fallback_w_by_count=agree_w_by_count_data,
+                        )
+                    elif agree_imbalance_scope == "dataset":
+                        voxel_weights = build_agree_weight_map_table(
+                            agree_count=ac,
+                            valid_mask=ignore_mask,
+                            weight_table=agree_w_by_count_data or {},
+                            gt_sentinel=agree_gt_sentinel,
+                            gt_weight=w_gt,
+                        )
+                    else:
+                        raise ValueError(f"Unknown --agree_imbalance_scope: {agree_imbalance_scope}")
+                else:
+                    raise ValueError(f"Unknown --agree_weight_mode: {agree_weight_mode}")
             else:
-                label_source_weights = None
+                # Legacy per-voxel reliability weights from Graph LP source masks (binary).
+                # Only used in standard few_samples mode; ignored for few_points/few_slices.
+                use_source_weights = (
+                    getattr(args, "train_label_source_dir", "") != ""
+                    and args.fewshot_mode == "few_samples"
+                    and ("label_source" in batch)
+                )
+                if use_source_weights:
+                    src = batch["label_source"].to(device).float()  # (B,1,X,Y,Z)
+                    if source_weight_mode == "raw":
+                        # Legacy behavior: directly weight LP-only voxels by --source_weight_lp (GT weight fixed to 1.0).
+                        w_lp_eff = float(getattr(args, "source_weight_lp", 1.0))
+                    elif source_weight_mode == "decoupled":
+                        # Decouple imbalance normalization from pseudo-label confidence:
+                        #   r = N_gt/N_lp (dataset or batch)
+                        #   gamma = --source_lp_quality (tunable, ideally 0.1..1 for reviewer-friendly reporting)
+                        #   w_lp_eff = w_gt * r * gamma
+                        if source_imbalance_scope == "batch":
+                            r_batch = compute_label_source_gt_to_lp_ratio_batch(
+                                src=src,
+                                valid_mask=ignore_mask,
+                                fallback_ratio=ratio_gt_to_lp_data,
+                            )
+                            src_r_sum += float(r_batch)
+                            src_r_n += 1
+                            src_r_min = float(r_batch) if src_r_min is None else min(src_r_min, float(r_batch))
+                            src_r_max = float(r_batch) if src_r_max is None else max(src_r_max, float(r_batch))
+                            r = float(r_batch)
+                        elif source_imbalance_scope == "dataset":
+                            r = float(ratio_gt_to_lp_data)
+                        else:
+                            raise ValueError(f"Unknown --source_imbalance_scope: {source_imbalance_scope}")
+                        w_lp_eff = float(w_gt) * float(r) * float(source_lp_quality)
+                    else:
+                        raise ValueError(f"Unknown --source_weight_mode: {source_weight_mode}")
+
+                    voxel_weights = torch.where(
+                        src > 0.5,
+                        torch.ones_like(src) * float(w_gt),
+                        torch.ones_like(src) * float(w_lp_eff),
+                    )
+                else:
+                    voxel_weights = None
 
             # Supervision masks
             if args.fewshot_mode == "few_points":
@@ -2325,9 +2672,9 @@ def train(args):
             supervised_count = int((ce_target_seed != 255).sum().item())
             ce_sup = torch.tensor(0.0, device=device)
             if supervised_count > 0:
-                if label_source_weights is not None:
+                if voxel_weights is not None:
                     # Restrict weights to supervised voxels
-                    w_sup = label_source_weights.clone()
+                    w_sup = voxel_weights.clone()
                     w_sup[(~seed_mask) | (lbl == 6)] = 0.0
                     ce_sup = cross_entropy_with_voxel_weights(
                         logits=logits,
@@ -2369,8 +2716,8 @@ def train(args):
             if supervised_count == 0:
                 dice = torch.tensor(0.0, device=device)
             else:
-                if label_source_weights is not None:
-                    w_dice = label_source_weights * seed_mask.float()
+                if voxel_weights is not None:
+                    w_dice = voxel_weights * seed_mask.float()
                     dice = dice_loss_masked_weighted(logits, lbl, ignore_mask & seed_mask, w_dice)
                 else:
                     dice = dice_loss_masked(logits, lbl, ignore_mask & seed_mask)
@@ -2584,6 +2931,16 @@ def parse_args(argv: List[str] | None = None):
             "purely graph-propagated SVs in few_samples mode. See --source_weight_mode/--source_imbalance_scope/--source_lp_quality."
         ),
     )
+    p.add_argument(
+        "--train_label_agreement_dir",
+        type=str,
+        default="",
+        help=(
+            "[Optional] Directory with per-voxel agreement-count maps saved as <id>_agree_count.npy "
+            "(or a run dir containing agreement/). Used to weight loss by ensemble agreement in few_samples mode. "
+            "GT-supported voxels can be encoded as agree_count==--agree_gt_sentinel (default 255)."
+        ),
+    )
     p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--num_workers", type=int, default=8)
@@ -2687,6 +3044,47 @@ def parse_args(argv: List[str] | None = None):
         type=float,
         default=1.0,
         help="In --source_weight_mode=raw: per-voxel loss weight for LP-only voxels (label_source=0). Ignored in decoupled mode.",
+    )
+    # Agreement-count weighting for pseudo-label ensembles (few_samples only; requires --train_label_agreement_dir)
+    p.add_argument(
+        "--agree_gt_sentinel",
+        type=int,
+        default=255,
+        help="Special agree_count value reserved for the GT-supported tier (default: 255).",
+    )
+    p.add_argument(
+        "--agree_weight_mode",
+        type=str,
+        default="table",
+        choices=["table", "decoupled"],
+        help=(
+            "How to weight loss using per-voxel agree_count maps in few_samples mode. "
+            "'table': use --agree_weight_table mapping count->weight. "
+            "'decoupled': w_gt=1 and w_c=(N_gt/N_c)*gamma_c, where gamma_c is from --agree_gamma_table and "
+            "N_gt/N_c is computed from the dataset or per batch per --agree_imbalance_scope."
+        ),
+    )
+    p.add_argument(
+        "--agree_weight_table",
+        type=str,
+        default="",
+        help="For --agree_weight_mode=table: mapping 'count:weight' pairs, e.g. \"1:0,2:0.02,3:0.1,4:0.2\".",
+    )
+    p.add_argument(
+        "--agree_gamma_table",
+        type=str,
+        default="",
+        help="For --agree_weight_mode=decoupled: mapping 'count:gamma' pairs, e.g. \"1:0,2:0.01,3:0.05,4:0.1\".",
+    )
+    p.add_argument(
+        "--agree_imbalance_scope",
+        type=str,
+        default="dataset",
+        choices=["dataset", "batch"],
+        help=(
+            "When --agree_weight_mode=decoupled, compute N_gt/N_c from the whole train set ('dataset') "
+            "or from each cropped batch ('batch', fast). Dataset weights are also used as a fallback for degenerate batches."
+        ),
     )
     # Few-shot fixed-budget control
     p.add_argument("--fewshot_static", action="store_true", help="Use a fixed per-volume supervision mask (precomputed once) for few_points mode")

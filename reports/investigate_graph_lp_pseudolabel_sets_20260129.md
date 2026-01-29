@@ -78,7 +78,7 @@ Largest regressions:
 
 Persistent hard case: `SN21_I33` is the worst across multiple variants.
 
-## 5) Combining pseudo-label runs (ensembles) and confidence filtering
+## 5) Combining pseudo-label runs (ensembles) and agreement counts
 
 ### 5.1 Simple ensemble vote improves pseudo labels (small but consistent)
 
@@ -90,7 +90,7 @@ We tested majority vote (ties broken by `Q`):
 `vote(C,O,M,Q)` slightly improves class-4 and reduces regressions vs using `Q` alone.
 
 If you want to actually *materialize* this ensemble as a new pseudo-label set on disk:
-- Script: `scripts/build_graph_lp_ensemble_labels.py`
+- Script: `scripts/build_graph_lp_ensemble_labels.py` (writes `labels/` + `agreement/`)
 
 ### 5.2 Agreement / confidence is a strong “noise detector”
 
@@ -121,15 +121,21 @@ Takeaway:
 
 These are concrete next experiments that directly use the findings above.
 
-### A) Train on ensemble labels + confidence-derived source masks
-1) Build ensemble labels and a confidence-based `source_masks/`:
-`python3 scripts/build_graph_lp_ensemble_labels.py --datalist datalist_train_new.json --out_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ_thr3 --label_dir C=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000 --label_dir O=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive --label_dir M=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/moments --label_dir Q=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16 --tie_break Q --seed_source_mask_dir runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16/source_masks --confidence_threshold 3 --write_source_masks --write_confidence_maps`
+### A) Train on ensemble labels + agreement-count weighting (dedicated code support)
+1) Build ensemble labels and per-voxel `agree_count` maps:
+`python3 scripts/build_graph_lp_ensemble_labels.py --datalist datalist_train_new.json --out_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ --label_dir C=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000 --label_dir O=runs/graph_lp_prop_0p1pct_k10_a0.9_new_n12000_outerbg_adaptive --label_dir M=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/moments --label_dir Q=runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16 --tie_break Q --seed_source_mask_dir runs/graph_lp_3desc_eval/graph_lp_3desc_20260109-162446_k10_a0.9_sigPhimedian/quantiles16/source_masks --write_source_masks`
 
-2) Train using:
-- `--train_label_override_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ_thr3/labels`
-- `--train_label_source_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ_thr3/source_masks`
+Notes:
+- `agreement/<id>_agree_count.npy` stores raw `maxc` for pseudo voxels (1..K).
+- Voxels in seed-supported SVs are encoded as `agree_count=255` (GT tier).
+- All thresholding/weights should be decided in training, not in the builder.
 
-This changes the weighting target from “seeded vs graph-only” to “seeded-or-high-confidence vs low-confidence”.
+2) Train using (example for K=4):
+- `--train_label_override_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ/labels`
+- `--train_label_agreement_dir runs/graph_lp_ensemble_vote_C_O_M_Q_tieQ`
+- `--agree_weight_mode table --agree_weight_table "4:0.20,3:0.10,2:0.02,1:0.00"`
+
+This changes the weighting target from “seeded vs graph-only” to “seeded (agree_count=255) + graded confidence by agreement count”.
 
 ### B) Curriculum: start with maxc=4 only, then relax
 Because maxc=4 voxels are very accurate (Dice ~0.86 on graph-only subset), you can:
@@ -151,4 +157,3 @@ If you want to improve the intensity-aware method itself, inspect the worst regr
   - `scripts/analyze_graph_lp_pseudolabel_sets.py` (use `--preset wp5_graphlp_intensity_vs_coords`)
 - Ensemble builder:
   - `scripts/build_graph_lp_ensemble_labels.py` (writes a new pseudo-label set on disk)
-
