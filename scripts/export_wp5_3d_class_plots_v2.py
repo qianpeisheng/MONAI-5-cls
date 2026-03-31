@@ -1,23 +1,16 @@
 #!/usr/bin/env python3
 """
-Export 3D class-wise figures (static) for WP5 volumes.
+Export 4-panel 3D class-wise figures for WP5 volumes.
 
 For each case and for each foreground class (default: 1..4), saves a
-single 3-panel 3D figure:
-  [GT class surface] [Fully Pred class surface] [1% Voxel class surface]
+single 4-panel 3D figure:
+  [GT] [Fully supervised] [Sparse supervision] [Ours]
 
-This reuses the Matplotlib + scikit-image marching cubes approach from the
-Streamlit app's fallback, but runs offline to produce publication-ready images.
-
-Usage (single line):
-  python3 scripts/export_wp5_3d_class_plots.py \
-    --datalist /home/peisheng/MONAI/datalist_test.json \
-    --pred_fully /home/peisheng/MONAI/runs/grid_clip_zscore/scratch_subset_100/eval_20251021-120429/preds \
-    --pred_voxel1 /home/peisheng/MONAI/runs/fp_1pct_global_d0_20251021-153502_eval/preds \
-    --out runs/exports_3d_class_plots --classes 1 2 3 4 --step 2 --opacity 0.55 --dpi 300
+Usage:
+  python3 scripts/export_wp5_3d_class_plots_v2.py \
+    --out runs/exports_3d_class_plots_v2 --max_cases 1 --dpi 300
 
 Requirements: numpy, nibabel, matplotlib, scikit-image
-  pip install numpy nibabel matplotlib scikit-image
 """
 
 from __future__ import annotations
@@ -26,7 +19,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple
 
 import numpy as np
 
@@ -161,17 +154,17 @@ def plot_class_surfaces_four_panel(
     case_id: str,
     gt: Optional[np.ndarray],
     pred_full: Optional[np.ndarray],
-    pred_vox1: Optional[np.ndarray],
+    pred_sparse: Optional[np.ndarray],
+    pred_ours: Optional[np.ndarray],
     cls: int,
     step: int = 2,
     opacity: float = 0.55,
     dpi: int = 300,
 ) -> None:
-    fig = plt.figure(figsize=(12, 4.5), dpi=dpi)
-    fig.suptitle(f"{case_id} — class {cls}", fontsize=18, fontweight='bold')
+    fig = plt.figure(figsize=(16, 4.5), dpi=dpi)
 
     def add_panel(ax, mask: Optional[np.ndarray], title: str, color: str):
-        ax.set_title(f"{title} (class {cls})", fontsize=14, fontweight='bold')
+        ax.set_title(title, fontsize=14, fontweight='bold')
         ax.set_axis_off()
         if mask is None:
             ax.text2D(0.5, 0.5, 'N/A', transform=ax.transAxes, ha='center', va='center', fontsize=13, fontweight='bold')
@@ -187,15 +180,17 @@ def plot_class_surfaces_four_panel(
         verts, faces = mesh
         ax.plot_trisurf(verts[:, 0], verts[:, 1], faces, verts[:, 2], color=color, linewidth=0.1, antialiased=True, alpha=opacity)
 
-    # Panels: GT, Fully, 1% Voxel
-    ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+    ax1 = fig.add_subplot(1, 4, 1, projection='3d')
     add_panel(ax1, gt, 'GT', 'green')
 
-    ax2 = fig.add_subplot(1, 3, 2, projection='3d')
-    add_panel(ax2, pred_full, 'Fully Sup (0.903)', 'red')
+    ax2 = fig.add_subplot(1, 4, 2, projection='3d')
+    add_panel(ax2, pred_full, 'Fully supervised', 'red')
 
-    ax3 = fig.add_subplot(1, 3, 3, projection='3d')
-    add_panel(ax3, pred_vox1, 'COMQ 0.1% (0.863)', 'orange')
+    ax3 = fig.add_subplot(1, 4, 3, projection='3d')
+    add_panel(ax3, pred_sparse, 'Sparse supervision', 'blue')
+
+    ax4 = fig.add_subplot(1, 4, 4, projection='3d')
+    add_panel(ax4, pred_ours, 'Ours', 'orange')
 
     out_png.parent.mkdir(parents=True, exist_ok=True)
     plt.tight_layout()
@@ -203,90 +198,108 @@ def plot_class_surfaces_four_panel(
     plt.close(fig)
 
 
+def _process_one_case(task):
+    """Worker function: load volumes for one case, render all classes."""
+    (rec_idx, rec, pred_full_dir, pred_sparse_dir, pred_ours_dir,
+     out_dir, classes, step, opacity, dpi) = task
+
+    cid = rec.get("id", f"case_{rec_idx}")
+    img_path = Path(rec.get("image", ""))
+    lbl_path = Path(rec.get("label", ""))
+    if not img_path.exists() or not lbl_path.exists():
+        return f"[Skip] Missing image/label for case {cid}"
+
+    p_full = find_pred_path(pred_full_dir, img_path, cid)
+    p_sparse = find_pred_path(pred_sparse_dir, img_path, cid)
+    p_ours = find_pred_path(pred_ours_dir, img_path, cid)
+
+    lbl_vol, _ = load_nii(lbl_path)
+    pf_vol = ps_vol = po_vol = None
+    if p_full is not None:
+        pf_vol, _ = load_volume_any(p_full)
+        if pf_vol.ndim == 4 and pf_vol.shape[0] == 1:
+            pf_vol = pf_vol[0]
+    if p_sparse is not None:
+        ps_vol, _ = load_volume_any(p_sparse)
+        if ps_vol.ndim == 4 and ps_vol.shape[0] == 1:
+            ps_vol = ps_vol[0]
+    if p_ours is not None:
+        po_vol, _ = load_volume_any(p_ours)
+        if po_vol.ndim == 4 and po_vol.shape[0] == 1:
+            po_vol = po_vol[0]
+
+    if pf_vol is not None and pf_vol.shape != lbl_vol.shape:
+        pf_vol = center_pad_or_crop(pf_vol, lbl_vol.shape)
+    if ps_vol is not None and ps_vol.shape != lbl_vol.shape:
+        ps_vol = center_pad_or_crop(ps_vol, lbl_vol.shape)
+    if po_vol is not None and po_vol.shape != lbl_vol.shape:
+        po_vol = center_pad_or_crop(po_vol, lbl_vol.shape)
+
+    for cls in classes:
+        out_png = out_dir / cid / f"class_{cls}.png"
+        plot_class_surfaces_four_panel(
+            out_png=out_png, case_id=cid, gt=lbl_vol,
+            pred_full=pf_vol, pred_sparse=ps_vol, pred_ours=po_vol,
+            cls=cls, step=step, opacity=opacity, dpi=dpi,
+        )
+    return f"{cid} done ({len(classes)} classes)"
+
+
 def main():
+    import multiprocessing as mp
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--datalist", type=str, default="/home/peisheng/MONAI/datalist_test_new.json")
     ap.add_argument("--pred_fully", type=str, default="/home/peisheng/MONAI/runs/wp5_full_supervised_20251210-164804/eval/preds")
-    ap.add_argument("--pred_voxel1", type=str, default="/data3/MONAI_experiments/sweep_graphlp_conf_ens_lossw_sweep40/COMQ_dec_bs_g4_0p20_g3_0p15_g2_0p00_20260130-005424/eval/preds")
-    ap.add_argument("--out", type=str, default="runs/exports_3d_class_plots")
+    ap.add_argument("--pred_sparse", type=str, default="/home/peisheng/MONAI/runs/wp5_fewpoints_0_1pct_global_20251210-191641/eval/preds")
+    ap.add_argument("--pred_ours", type=str, default="/data3/MONAI_experiments/sweep_graphlp_conf_ens_lossw_sweep40/COMQ_dec_bs_g4_0p20_g3_0p15_g2_0p00_20260130-005424/eval/preds")
+    ap.add_argument("--out", type=str, default="runs/exports_3d_class_plots_v2")
     ap.add_argument("--classes", type=int, nargs="+", default=[1, 2, 3, 4])
     ap.add_argument("--step", type=int, default=2, help="marching cubes step size (>=1)")
     ap.add_argument("--opacity", type=float, default=0.55)
     ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--max_cases", type=int, default=0, help="0 means all")
     ap.add_argument("--case_filter", type=str, default="", help="Substring to filter case ids")
+    ap.add_argument("--workers", type=int, default=0, help="0 = number of CPUs")
     args = ap.parse_args()
 
     datalist_p = Path(args.datalist)
     pred_full_dir = Path(args.pred_fully)
-    pred_voxel_dir = Path(args.pred_voxel1)
+    pred_sparse_dir = Path(args.pred_sparse)
+    pred_ours_dir = Path(args.pred_ours)
     out_dir = Path(args.out)
 
     if not datalist_p.exists():
         print(f"ERROR: datalist not found: {datalist_p}", file=sys.stderr)
         sys.exit(1)
-    if not pred_full_dir.exists():
-        print(f"ERROR: pred_fully dir not found: {pred_full_dir}", file=sys.stderr)
-        sys.exit(1)
-    if not pred_voxel_dir.exists():
-        print(f"ERROR: pred_voxel1 dir not found: {pred_voxel_dir}", file=sys.stderr)
-        sys.exit(1)
+    for label, d in [("pred_fully", pred_full_dir), ("pred_sparse", pred_sparse_dir), ("pred_ours", pred_ours_dir)]:
+        if not d.exists():
+            print(f"ERROR: {label} dir not found: {d}", file=sys.stderr)
+            sys.exit(1)
 
     records = json.loads(datalist_p.read_text())
     if not isinstance(records, list) or not records:
         print("ERROR: datalist is empty or not a list", file=sys.stderr)
         sys.exit(1)
 
-    done = 0
+    tasks = []
     for i, rec in enumerate(records):
         cid = rec.get("id", f"case_{i}")
         if args.case_filter and args.case_filter not in cid:
             continue
-        img_path = Path(rec.get("image", ""))
-        lbl_path = Path(rec.get("label", ""))
-        if not img_path.exists() or not lbl_path.exists():
-            print(f"[Skip] Missing image/label for case {cid}")
-            continue
-
-        p_full = find_pred_path(pred_full_dir, img_path, cid)
-        p_vox1 = find_pred_path(pred_voxel_dir, img_path, cid)
-
-        # Load volumes
-        lbl_vol, _ = load_nii(lbl_path)
-        pf_vol = None
-        pv_vol = None
-        if p_full is not None:
-            pf_vol, _ = load_volume_any(p_full)
-            if pf_vol.ndim == 4 and pf_vol.shape[0] == 1:
-                pf_vol = pf_vol[0]
-        if p_vox1 is not None:
-            pv_vol, _ = load_volume_any(p_vox1)
-            if pv_vol.ndim == 4 and pv_vol.shape[0] == 1:
-                pv_vol = pv_vol[0]
-
-        # Align shapes to label volume (labels usually define space)
-        if pf_vol is not None and pf_vol.shape != lbl_vol.shape:
-            pf_vol = center_pad_or_crop(pf_vol, lbl_vol.shape)
-        if pv_vol is not None and pv_vol.shape != lbl_vol.shape:
-            pv_vol = center_pad_or_crop(pv_vol, lbl_vol.shape)
-
-        for cls in args.classes:
-            out_png = out_dir / cid / f"class_{cls}.png"
-            plot_class_surfaces_four_panel(
-                out_png=out_png,
-                case_id=cid,
-                gt=lbl_vol,
-                pred_full=pf_vol,
-                pred_vox1=pv_vol,
-                cls=cls,
-                step=args.step,
-                opacity=args.opacity,
-                dpi=args.dpi,
-            )
-
-        done += 1
-        if args.max_cases > 0 and done >= args.max_cases:
+        tasks.append((
+            i, rec, pred_full_dir, pred_sparse_dir, pred_ours_dir,
+            out_dir, args.classes, args.step, args.opacity, args.dpi,
+        ))
+        if args.max_cases > 0 and len(tasks) >= args.max_cases:
             break
+
+    n_workers = args.workers if args.workers > 0 else min(mp.cpu_count(), len(tasks))
+    print(f"Processing {len(tasks)} cases with {n_workers} workers ...")
+
+    with mp.Pool(n_workers) as pool:
+        for idx, result in enumerate(pool.imap_unordered(_process_one_case, tasks)):
+            print(f"[{idx+1}/{len(tasks)}] {result}")
 
     print(f"Done. Saved outputs under: {out_dir}")
 

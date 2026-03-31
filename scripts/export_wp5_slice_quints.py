@@ -1,24 +1,17 @@
 #!/usr/bin/env python3
 """
-Export 4-panel slice figures for WP5 volumes.
+Export 5-panel slice figures for WP5 volumes.
 
 For each case in a datalist (image/label/id), and for each slice along
 the specified axes (x, y, z), this script saves a high-resolution image
-with 4 columns: Data (grayscale), Ground Truth (overlay), Fully Supervised
-Prediction (overlay), and 1% Voxel Prediction (overlay).
+with 5 columns: Data (grayscale), Ground Truth (overlay), Fully supervised
+(overlay), Sparse supervision (overlay), and Ours (overlay).
 
-Defaults assume your fixed result folders and datalist path. You can
-override via flags if needed.
-
-Usage (single line):
-  python3 scripts/export_wp5_slice_quads.py \
-    --datalist /home/peisheng/MONAI/datalist_test.json \
-    --pred_fully /home/peisheng/MONAI/runs/grid_clip_zscore/scratch_subset_100/eval_20251021-120429/preds \
-    --pred_voxel1 /home/peisheng/MONAI/runs/fp_1pct_global_d0_20251021-153502_eval/preds \
-    --out runs/exports_slice_quads --axes x y z --dpi 300 --alpha 0.4
+Usage:
+  python3 scripts/export_wp5_slice_quints.py \
+    --out runs/exports_slice_quints_v2 --axes z --max_cases 1 --dpi 300
 
 Requirements: numpy, nibabel, matplotlib
-  pip install numpy nibabel matplotlib
 """
 
 from __future__ import annotations
@@ -155,12 +148,13 @@ def find_pred_path(pred_dir: Path, image_path: Path, case_id: str) -> Optional[P
     return any_pred[0] if any_pred else None
 
 
-def draw_and_save_quad(
+def draw_and_save_quint(
     out_png: Path,
     img_vol: np.ndarray,
     lbl_vol: Optional[np.ndarray],
     pred_full: Optional[np.ndarray],
-    pred_vox1: Optional[np.ndarray],
+    pred_sparse: Optional[np.ndarray],
+    pred_ours: Optional[np.ndarray],
     axis: str,
     index: int,
     alpha: float,
@@ -173,17 +167,20 @@ def draw_and_save_quad(
         img2d = img_vol[index, :, :]
         lbl2d = lbl_vol[index, :, :] if lbl_vol is not None else None
         pf2d = pred_full[index, :, :] if pred_full is not None else None
-        pv2d = pred_vox1[index, :, :] if pred_vox1 is not None else None
+        ps2d = pred_sparse[index, :, :] if pred_sparse is not None else None
+        po2d = pred_ours[index, :, :] if pred_ours is not None else None
     elif axis == "y":
         img2d = img_vol[:, index, :]
         lbl2d = lbl_vol[:, index, :] if lbl_vol is not None else None
         pf2d = pred_full[:, index, :] if pred_full is not None else None
-        pv2d = pred_vox1[:, index, :] if pred_vox1 is not None else None
+        ps2d = pred_sparse[:, index, :] if pred_sparse is not None else None
+        po2d = pred_ours[:, index, :] if pred_ours is not None else None
     else:  # z
         img2d = img_vol[:, :, index]
         lbl2d = lbl_vol[:, :, index] if lbl_vol is not None else None
         pf2d = pred_full[:, :, index] if pred_full is not None else None
-        pv2d = pred_vox1[:, :, index] if pred_vox1 is not None else None
+        ps2d = pred_sparse[:, :, index] if pred_sparse is not None else None
+        po2d = pred_ours[:, :, index] if pred_ours is not None else None
 
     import numpy as _np
     img2d = _np.flipud(_np.rot90(img2d, k=1))
@@ -191,13 +188,15 @@ def draw_and_save_quad(
         lbl2d = _np.flipud(_np.rot90(lbl2d, k=1))
     if pf2d is not None:
         pf2d = _np.flipud(_np.rot90(pf2d, k=1))
-    if pv2d is not None:
-        pv2d = _np.flipud(_np.rot90(pv2d, k=1))
+    if ps2d is not None:
+        ps2d = _np.flipud(_np.rot90(ps2d, k=1))
+    if po2d is not None:
+        po2d = _np.flipud(_np.rot90(po2d, k=1))
 
     vmin, vmax = robust_minmax(img2d)
 
-    fig, axes = plt.subplots(1, 4, figsize=(16, 4.8), dpi=dpi)
-    fig.suptitle(f"{case_id} — {axis} slice {index+1}/{nslices_axis}", fontsize=18, fontweight='bold')
+    fig, axes = plt.subplots(1, 5, figsize=(20, 4.8), dpi=dpi)
+
     # Panel 1: Data
     axes[0].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
     axes[0].set_title("Data", fontsize=14, fontweight='bold')
@@ -210,19 +209,26 @@ def draw_and_save_quad(
     axes[1].set_title("Ground Truth", fontsize=14, fontweight='bold')
     axes[1].axis("off")
 
-    # Panel 3: Fully Supervised overlay
+    # Panel 3: Fully supervised overlay
     axes[2].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
     if pf2d is not None:
         axes[2].imshow(colorize_seg2d(pf2d.T, alpha=alpha), origin="lower")
-    axes[2].set_title("Fully Supervised (0.903)", fontsize=14, fontweight='bold')
+    axes[2].set_title("Fully supervised", fontsize=14, fontweight='bold')
     axes[2].axis("off")
 
-    # Panel 4: 1% Voxel overlay
+    # Panel 4: Sparse supervision overlay
     axes[3].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
-    if pv2d is not None:
-        axes[3].imshow(colorize_seg2d(pv2d.T, alpha=alpha), origin="lower")
-    axes[3].set_title("COMQ 0.1% (0.863)", fontsize=14, fontweight='bold')
+    if ps2d is not None:
+        axes[3].imshow(colorize_seg2d(ps2d.T, alpha=alpha), origin="lower")
+    axes[3].set_title("Sparse supervision", fontsize=14, fontweight='bold')
     axes[3].axis("off")
+
+    # Panel 5: Ours overlay
+    axes[4].imshow(img2d.T, cmap="gray", origin="lower", vmin=vmin, vmax=vmax)
+    if po2d is not None:
+        axes[4].imshow(colorize_seg2d(po2d.T, alpha=alpha), origin="lower")
+    axes[4].set_title("Ours", fontsize=14, fontweight='bold')
+    axes[4].axis("off")
 
     plt.tight_layout()
     out_png.parent.mkdir(parents=True, exist_ok=True)
@@ -230,12 +236,74 @@ def draw_and_save_quad(
     plt.close(fig)
 
 
+def _process_one_case(task):
+    """Worker function: load volumes for one case, render all slices."""
+    (rec_idx, rec, pred_full_dir, pred_sparse_dir, pred_ours_dir,
+     out_dir, axes_list, alpha, dpi, max_slices, skip_if_missing) = task
+
+    cid = rec.get("id", f"case_{rec_idx}")
+    img_path = Path(rec.get("image", ""))
+    lbl_path = Path(rec.get("label", ""))
+    if not img_path.exists() or not lbl_path.exists():
+        return f"[Skip] Missing image/label for case {cid}"
+
+    p_full = find_pred_path(pred_full_dir, img_path, cid)
+    p_sparse = find_pred_path(pred_sparse_dir, img_path, cid)
+    p_ours = find_pred_path(pred_ours_dir, img_path, cid)
+    if skip_if_missing and (p_full is None or p_sparse is None or p_ours is None):
+        return f"[Skip] Missing preds for case {cid}"
+
+    img_vol, _ = load_nii(img_path)
+    lbl_vol, _ = load_nii(lbl_path)
+    pf_vol = ps_vol = po_vol = None
+    if p_full is not None:
+        pf_vol, _ = load_volume_any(p_full)
+        if pf_vol.ndim == 4 and pf_vol.shape[0] == 1:
+            pf_vol = pf_vol[0]
+    if p_sparse is not None:
+        ps_vol, _ = load_volume_any(p_sparse)
+        if ps_vol.ndim == 4 and ps_vol.shape[0] == 1:
+            ps_vol = ps_vol[0]
+    if p_ours is not None:
+        po_vol, _ = load_volume_any(p_ours)
+        if po_vol.ndim == 4 and po_vol.shape[0] == 1:
+            po_vol = po_vol[0]
+
+    if lbl_vol.shape != img_vol.shape:
+        lbl_vol = center_pad_or_crop(lbl_vol, img_vol.shape)
+    if pf_vol is not None and pf_vol.shape != img_vol.shape:
+        pf_vol = center_pad_or_crop(pf_vol, img_vol.shape)
+    if ps_vol is not None and ps_vol.shape != img_vol.shape:
+        ps_vol = center_pad_or_crop(ps_vol, img_vol.shape)
+    if po_vol is not None and po_vol.shape != img_vol.shape:
+        po_vol = center_pad_or_crop(po_vol, img_vol.shape)
+
+    n_slices = 0
+    for ax in axes_list:
+        dim = {"x": 0, "y": 1, "z": 2}[ax]
+        nslices = int(img_vol.shape[dim])
+        limit = nslices if max_slices <= 0 else min(nslices, max_slices)
+        for sidx in range(limit):
+            out_png = out_dir / cid / ax / f"{cid}_{ax}{sidx:03d}.png"
+            draw_and_save_quint(
+                out_png=out_png, img_vol=img_vol, lbl_vol=lbl_vol,
+                pred_full=pf_vol, pred_sparse=ps_vol, pred_ours=po_vol,
+                axis=ax, index=sidx, alpha=alpha, dpi=dpi,
+                case_id=cid, nslices_axis=nslices,
+            )
+            n_slices += 1
+    return f"{cid} done ({n_slices} slices)"
+
+
 def main():
+    import multiprocessing as mp
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--datalist", type=str, default="/home/peisheng/MONAI/datalist_test_new.json")
     ap.add_argument("--pred_fully", type=str, default="/home/peisheng/MONAI/runs/wp5_full_supervised_20251210-164804/eval/preds")
-    ap.add_argument("--pred_voxel1", type=str, default="/data3/MONAI_experiments/sweep_graphlp_conf_ens_lossw_sweep40/COMQ_dec_bs_g4_0p20_g3_0p15_g2_0p00_20260130-005424/eval/preds")
-    ap.add_argument("--out", type=str, default="runs/exports_slice_quads")
+    ap.add_argument("--pred_sparse", type=str, default="/home/peisheng/MONAI/runs/wp5_fewpoints_0_1pct_global_20251210-191641/eval/preds")
+    ap.add_argument("--pred_ours", type=str, default="/data3/MONAI_experiments/sweep_graphlp_conf_ens_lossw_sweep40/COMQ_dec_bs_g4_0p20_g3_0p15_g2_0p00_20260130-005424/eval/preds")
+    ap.add_argument("--out", type=str, default="runs/exports_slice_quints_v2")
     ap.add_argument("--axes", type=str, nargs="+", default=["z", "y", "x"], choices=["x", "y", "z"])
     ap.add_argument("--alpha", type=float, default=0.4)
     ap.add_argument("--dpi", type=int, default=300)
@@ -243,94 +311,48 @@ def main():
     ap.add_argument("--max_slices", type=int, default=0, help="0 means all per axis")
     ap.add_argument("--skip_if_missing_pred", action="store_true", help="Skip case if any pred missing")
     ap.add_argument("--case_filter", type=str, default="", help="Substring to filter case ids")
+    ap.add_argument("--workers", type=int, default=0, help="0 = number of CPUs")
     args = ap.parse_args()
 
     datalist_p = Path(args.datalist)
     pred_full_dir = Path(args.pred_fully)
-    pred_voxel_dir = Path(args.pred_voxel1)
+    pred_sparse_dir = Path(args.pred_sparse)
+    pred_ours_dir = Path(args.pred_ours)
     out_dir = Path(args.out)
 
     if not datalist_p.exists():
         print(f"ERROR: datalist not found: {datalist_p}", file=sys.stderr)
         sys.exit(1)
-    if not pred_full_dir.exists():
-        print(f"ERROR: pred_fully dir not found: {pred_full_dir}", file=sys.stderr)
-        sys.exit(1)
-    if not pred_voxel_dir.exists():
-        print(f"ERROR: pred_voxel1 dir not found: {pred_voxel_dir}", file=sys.stderr)
-        sys.exit(1)
+    for label, d in [("pred_fully", pred_full_dir), ("pred_sparse", pred_sparse_dir), ("pred_ours", pred_ours_dir)]:
+        if not d.exists():
+            print(f"ERROR: {label} dir not found: {d}", file=sys.stderr)
+            sys.exit(1)
 
     records = json.loads(datalist_p.read_text())
     if not isinstance(records, list) or not records:
         print("ERROR: datalist is empty or not a list", file=sys.stderr)
         sys.exit(1)
 
-    total = len(records)
-    done_cases = 0
+    # Build task list
+    tasks = []
     for i, rec in enumerate(records):
         cid = rec.get("id", f"case_{i}")
         if args.case_filter and args.case_filter not in cid:
             continue
-
-        img_path = Path(rec.get("image", ""))
-        lbl_path = Path(rec.get("label", ""))
-        if not img_path.exists() or not lbl_path.exists():
-            print(f"[Skip] Missing image/label for case {cid}")
-            continue
-
-        # Locate predictions
-        p_full = find_pred_path(pred_full_dir, img_path, cid)
-        p_vox1 = find_pred_path(pred_voxel_dir, img_path, cid)
-        if args.skip_if_missing_pred and (p_full is None or p_vox1 is None):
-            print(f"[Skip] Missing preds for case {cid}: full={p_full} voxel1={p_vox1}")
-            continue
-
-        # Load volumes
-        img_vol, _ = load_nii(img_path)
-        lbl_vol, _ = load_nii(lbl_path)
-        pf_vol = None
-        pv_vol = None
-        if p_full is not None:
-            pf_vol, _ = load_volume_any(p_full)
-            if pf_vol.ndim == 4 and pf_vol.shape[0] == 1:
-                pf_vol = pf_vol[0]
-        if p_vox1 is not None:
-            pv_vol, _ = load_volume_any(p_vox1)
-            if pv_vol.ndim == 4 and pv_vol.shape[0] == 1:
-                pv_vol = pv_vol[0]
-
-        # Align shapes to image volume
-        if lbl_vol.shape != img_vol.shape:
-            lbl_vol = center_pad_or_crop(lbl_vol, img_vol.shape)
-        if pf_vol is not None and pf_vol.shape != img_vol.shape:
-            pf_vol = center_pad_or_crop(pf_vol, img_vol.shape)
-        if pv_vol is not None and pv_vol.shape != img_vol.shape:
-            pv_vol = center_pad_or_crop(pv_vol, img_vol.shape)
-
-        # Iterate axes and slices
-        for ax in args.axes:
-            dim = {"x": 0, "y": 1, "z": 2}[ax]
-            nslices = int(img_vol.shape[dim])
-            limit = nslices if args.max_slices <= 0 else min(nslices, args.max_slices)
-            for sidx in range(limit):
-                out_png = out_dir / cid / ax / f"{cid}_{ax}{sidx:03d}.png"
-                draw_and_save_quad(
-                    out_png=out_png,
-                    img_vol=img_vol,
-                    lbl_vol=lbl_vol,
-                    pred_full=pf_vol,
-                    pred_vox1=pv_vol,
-                    axis=ax,
-                    index=sidx,
-                    alpha=args.alpha,
-                    dpi=args.dpi,
-                    case_id=cid,
-                    nslices_axis=nslices,
-                )
-
-        done_cases += 1
-        if args.max_cases > 0 and done_cases >= args.max_cases:
+        tasks.append((
+            i, rec, pred_full_dir, pred_sparse_dir, pred_ours_dir,
+            out_dir, args.axes, args.alpha, args.dpi,
+            args.max_slices, args.skip_if_missing_pred,
+        ))
+        if args.max_cases > 0 and len(tasks) >= args.max_cases:
             break
+
+    n_workers = args.workers if args.workers > 0 else min(mp.cpu_count(), len(tasks))
+    print(f"Processing {len(tasks)} cases with {n_workers} workers ...")
+
+    with mp.Pool(n_workers) as pool:
+        for idx, result in enumerate(pool.imap_unordered(_process_one_case, tasks)):
+            print(f"[{idx+1}/{len(tasks)}] {result}")
 
     print(f"Done. Saved outputs under: {out_dir}")
 
